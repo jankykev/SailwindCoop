@@ -34,6 +34,13 @@ namespace SailwindCoop.Sync
             public Component PhysSwitcher;
             public bool PrevPaused;
             public bool PrevSwitcherEnabled;
+            /// <summary>The body the hull hangs under when the hull has none of its own. Not driven:
+            /// kept only to report how far its physics carries it from the hull we place.</summary>
+            public Rigidbody RootRb;
+            public Vector3 HullLocalPos;
+            public Quaternion HullLocalRot;
+            public float LoggedDrift;
+            public float NextDriftLog;
             /// <summary>False while we are only buffering: physics is still vanilla and we apply nothing.</summary>
             public bool Engaged;
         }
@@ -190,9 +197,74 @@ namespace SailwindCoop.Sync
                 // with an error proportional to boat velocity — seen as the player/camera bobbing
                 // vertically in time with the swell. BoatPhysicsSwitcher re-enables Interpolate every
                 // LateUpdate (we disable that component while slaved), this is the belt-and-braces.
+                // In game 0.39 the body is on the hull's parent, so cb.Rb is null and none of this
+                // runs: see ClientBoat.RootRb.
                 if (cb.Rb != null && cb.Rb.interpolation != RigidbodyInterpolation.None)
                     cb.Rb.interpolation = RigidbodyInterpolation.None;
                 cb.Net.Apply(cb.Boat, _net.Clock.ServerTick);
+                LogRootDrift(cb);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Client: the boat root we do not drive
+        // -----------------------------------------------------------------
+
+        private const float DriftLogPeriod = 30f;
+        private const float DriftLogStep = 0.5f;
+
+        /// <summary>Hits and water over the side that <see cref="BoatDamagePatches"/> kept from a
+        /// client's copy of a boat in this session.</summary>
+        public static int IgnoredImpacts, IgnoredOverflows;
+
+        /// <summary>Client: is <paramref name="boatRoot"/> (the object with <c>BoatDamage</c>) the
+        /// root of a hull placed from the host's stream.</summary>
+        public bool Drives(Transform boatRoot)
+        {
+            if (boatRoot == null || _net.Role != Role.Client) return false;
+            foreach (var cb in _clientBoats.Values)
+                if (cb.Engaged && cb.Boat != null && cb.Boat.IsChildOf(boatRoot)) return true;
+            return false;
+        }
+
+        /// <summary>How far the root's own physics has carried it from where the hull is placed:
+        /// metres and degrees against the hull's pose under the root at engage.</summary>
+        private static bool RootDrift(ClientBoat cb, out float metres, out float degrees)
+        {
+            metres = 0f; degrees = 0f;
+            if (cb.RootRb == null || cb.Boat == null) return false;
+            Transform root = cb.RootRb.transform;
+            metres = Vector3.Distance(root.TransformPoint(cb.HullLocalPos), cb.Boat.position);
+            degrees = Quaternion.Angle(root.rotation * cb.HullLocalRot, cb.Boat.rotation);
+            return true;
+        }
+
+        private static void LogRootDrift(ClientBoat cb)
+        {
+            if (cb.RootRb == null || Time.unscaledTime < cb.NextDriftLog) return;
+            cb.NextDriftLog = Time.unscaledTime + DriftLogPeriod;
+            if (!RootDrift(cb, out float metres, out float degrees)) return;
+            if (Mathf.Abs(metres - cb.LoggedDrift) < DriftLogStep) return;
+            cb.LoggedDrift = metres;
+            Plugin.Logger.LogInfo("[BoatSync] Boat #" + cb.Index + " root is " + metres.ToString("F1") + " m, " +
+                                  degrees.ToString("F0") + " deg from its hull (kinematic=" + cb.RootRb.isKinematic +
+                                  ", speed=" + cb.RootRb.velocity.magnitude.ToString("F1") + ")");
+        }
+
+        /// <summary>One line per placed boat for the debug panel.</summary>
+        public void DescribeClientBoats(List<string> lines)
+        {
+            foreach (var cb in _clientBoats.Values)
+            {
+                if (!cb.Engaged || cb.Boat == null) continue;
+                string line = "#" + cb.Index + " " + cb.Boat.name + ": ";
+                if (cb.Rb != null) line += "hull body driven";
+                else if (!RootDrift(cb, out float metres, out float degrees)) line += "no body";
+                else
+                    line += "root " + (cb.RootRb.isKinematic ? "kinematic" : "dynamic") + ", interp " +
+                            cb.RootRb.interpolation + ", off hull " + metres.ToString("F2") + " m / " +
+                            degrees.ToString("F1") + " deg";
+                lines.Add(line);
             }
         }
 
@@ -345,6 +417,16 @@ namespace SailwindCoop.Sync
                 cb.Rb.interpolation = RigidbodyInterpolation.None;
             }
 
+            cb.RootRb = cb.Rb == null ? boat.GetComponentInParent<Rigidbody>() : null;
+            if (cb.RootRb != null)
+            {
+                cb.HullLocalPos = cb.RootRb.transform.InverseTransformPoint(boat.position);
+                cb.HullLocalRot = Quaternion.Inverse(cb.RootRb.transform.rotation) * boat.rotation;
+                // The first measurement is always logged: "no drift" must be told from "not measured".
+                cb.LoggedDrift = float.NegativeInfinity;
+                cb.NextDriftLog = Time.unscaledTime + DriftLogPeriod;
+            }
+
             TrySetPhysicsPaused(cb, true);
             TrySetSwitcherEnabled(cb, slave: true);
             cb.Engaged = true;
@@ -365,6 +447,10 @@ namespace SailwindCoop.Sync
             Plugin.Logger.LogInfo("[BoatSync] Client boat #" + cb.Index + " in slave mode: correction=" +
                                   correction.ToString("F1") + " m, carriedPlayer=" + carry +
                                   ", rb=" + (cb.Rb != null) + ", physSwitcher=" + (cb.PhysSwitcher != null));
+            if (cb.RootRb != null)
+                Plugin.Logger.LogWarning("[BoatSync] Boat #" + cb.Index + ": the body is on the hull's parent '" +
+                                         cb.RootRb.name + "' and stays under this machine's physics (kinematic=" +
+                                         cb.RootRb.isKinematic + "); only the hull is placed.");
             if (correction > 2000f)
                 Plugin.Logger.LogWarning("[BoatSync] Boat #" + cb.Index + " correction is " +
                                          correction.ToString("F0") + " m - the client very likely loaded a " +
@@ -391,6 +477,7 @@ namespace SailwindCoop.Sync
 
             cb.Net.Clear();
             cb.Rb = null;
+            cb.RootRb = null;
             cb.PhysSwitcher = null;
             cb.Boat = null;
         }
@@ -471,6 +558,7 @@ namespace SailwindCoop.Sync
             _clientBoats.Clear();
             _hostBoats.Clear();
             _warnedUnknown.Clear();
+            IgnoredImpacts = IgnoredOverflows = 0;
             _firstBoatNetId = 0;
             _sendTimer = 0f;
             _refreshTimer = 0f;

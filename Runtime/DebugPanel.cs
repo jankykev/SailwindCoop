@@ -68,6 +68,7 @@ namespace SailwindCoop.Runtime
             GUILayout.Space(6);
             DrawLinkSimulation();
             GUILayout.Space(6);
+            DrawBoatBodies();
             DrawItemSpawn();
 
             GUILayout.EndArea();
@@ -612,6 +613,27 @@ namespace SailwindCoop.Runtime
             else
                 state = on ? "starts with the next LAN Join" : "off";
             GUILayout.Label(state, _label);
+        }
+
+        // -----------------------------------------------------------------
+        // Boat bodies — a client places the hull, the body is on the hull's parent
+        // -----------------------------------------------------------------
+
+        private readonly List<string> _boatLines = new List<string>();
+
+        private void DrawBoatBodies()
+        {
+            var boats = CoopBehaviour.Instance != null ? CoopBehaviour.Instance.Boats : null;
+            if (boats == null || _net.State != LinkState.Connected || _net.Role != Role.Client) return;
+            GUILayout.Label("- Boat bodies (client) -", _label);
+            _boatLines.Clear();
+            try { boats.DescribeClientBoats(_boatLines); }
+            catch (Exception e) { _boatLines.Add("unavailable: " + e.Message); }
+            if (_boatLines.Count == 0) GUILayout.Label("no boat placed yet", _label);
+            foreach (string line in _boatLines) GUILayout.Label(line, _label);
+            GUILayout.Label("own damage ignored: " + Sync.BoatSync.IgnoredImpacts + " hits, " +
+                            Sync.BoatSync.IgnoredOverflows + " water", _label);
+            GUILayout.Space(6);
         }
 
         private int SimSlider(string name, int value, int max, string unit)

@@ -9,6 +9,8 @@ All notable user-facing changes are documented in this file.
 - The Debug panel's island teleport could capsize the host's boat and throw it away once the
   game went on. The boat is now moved the way the game's own recovery moves it and ends up
   moored at the port.
+- A guest's copy of a boat could take hits and waves over the side of its own and sink while the
+  host's boat was whole. A guest's game no longer counts them; they come from the host.
 - The Debug panel's island list missed five ports (Dragon Cliffs, Fort Aestrin, Serpent Isle,
   Saffron Island, On'na) and had nine entries that led nowhere. Every port of the game is listed
   now; On'na has no place for a boat in the game and takes a player on foot only.

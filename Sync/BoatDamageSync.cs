@@ -393,9 +393,59 @@ namespace SailwindCoop.Sync
             bool oakumAlt = TryPatch(harmony, typeof(ShipItemOakum), "OnAltActivate", System.Type.EmptyTypes,
                 nameof(PreOakumAlt), nameof(PostOakumAlt));
 
+            bool impact = TryPrefix(harmony, "Impact", new[] { typeof(Collider), typeof(float) }, nameof(PreClientImpact));
+            bool overflow = TryPrefix(harmony, "Overflow", new[] { typeof(float) }, nameof(PreClientOverflow));
+
             Plugin.Logger.LogInfo("[BoatDamagePatches] Damage patches: HullOakum=" + hull +
-                                  ", WaterBail=" + water + ", OakumAlt=" + oakumAlt);
-            SailwindCoop.Runtime.PatchHealth.Report("Damage", (hull ? 1 : 0) + (water ? 1 : 0) + (oakumAlt ? 1 : 0), 3);
+                                  ", WaterBail=" + water + ", OakumAlt=" + oakumAlt +
+                                  ", ClientImpact=" + impact + ", ClientOverflow=" + overflow);
+            SailwindCoop.Runtime.PatchHealth.Report("Damage", (hull ? 1 : 0) + (water ? 1 : 0) + (oakumAlt ? 1 : 0) +
+                                                              (impact ? 1 : 0) + (overflow ? 1 : 0), 5);
+        }
+
+        private static bool TryPrefix(Harmony harmony, string method, System.Type[] args, string prefixName)
+        {
+            try
+            {
+                var mi = typeof(BoatDamage).GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, args, null);
+                if (mi == null)
+                {
+                    WarnPatch("[BoatDamagePatches] Not found BoatDamage." + method);
+                    return false;
+                }
+                harmony.Patch(mi, prefix: new HarmonyMethod(typeof(BoatDamagePatches).GetMethod(prefixName, BindingFlags.Static | BindingFlags.NonPublic)));
+                return true;
+            }
+            catch (System.Exception e)
+            {
+                WarnPatch("[BoatDamagePatches] BoatDamage." + method + ": " + e.Message);
+                return false;
+            }
+        }
+
+        // The host owns hull damage and water. A client's copy of the boat still has a body under
+        // this machine's physics, so the game would count that copy's own hits and water over the
+        // side; state comes only when the host's changes, and such damage would stay.
+        private static bool PreClientImpact(BoatDamage __instance)
+            => SailwindCoop.Runtime.PatchGuard.Prefix(() =>
+            {
+                if (!ClientCopy(__instance)) return true;
+                BoatSync.IgnoredImpacts++;
+                return false;
+            }, e => WarnPatch("[BoatDamagePatches] PreClientImpact: " + e.Message));
+
+        private static bool PreClientOverflow(BoatDamage __instance)
+            => SailwindCoop.Runtime.PatchGuard.Prefix(() =>
+            {
+                if (!ClientCopy(__instance)) return true;
+                BoatSync.IgnoredOverflows++;
+                return false;
+            }, e => WarnPatch("[BoatDamagePatches] PreClientOverflow: " + e.Message));
+
+        private static bool ClientCopy(BoatDamage damage)
+        {
+            var boats = SailwindCoop.Runtime.CoopBehaviour.Instance?.Boats;
+            return boats != null && damage != null && boats.Drives(damage.transform);
         }
 
         private static bool TryPatch(Harmony harmony, System.Type type, string method, System.Type[] args, string prefixName, string postfixName)
