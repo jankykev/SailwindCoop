@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using SailwindCoop.Net;
@@ -294,6 +295,10 @@ namespace SailwindCoop.Runtime
         // телепорт визуальной лодки не трогает. Пеший игрок переносится на причал (любая роль —
         // PlayerSync стримит real-space позу). Клиент на лодке сам телепортироваться не может —
         // лодка хост-авторитетна.
+        // Лодка переносится так же, как это делает сама игра (Recovery.RecoverBoat,
+        // DebugBoatTeleporter): под GameState.recovering, по этапам с ожиданием шагов физики,
+        // в конце швартуется к причалу. Перенос одним вызовом вне recovering опрокидывал лодку
+        // у хоста после остановки мира.
         // -----------------------------------------------------------------
 
         private List<RecoveryPort> _recoveryPorts;
@@ -303,11 +308,13 @@ namespace SailwindCoop.Runtime
         private void DrawIslandTeleport()
         {
             GUILayout.Label("- Island teleport (host moves the boat) -", _label);
-            if (_recoveryPorts == null) RefreshRecoveryPorts();
-            if (GUILayout.Button("Refresh port list (" + (_recoveryPorts != null ? _recoveryPorts.Count : 0) + ")"))
+            // The world was loaded again: the objects of the old list are gone.
+            if (_recoveryPorts == null || (_recoveryPorts.Count > 0 && _recoveryPorts[0] == null)) RefreshRecoveryPorts();
+            int count = (_recoveryPorts != null ? _recoveryPorts.Count : 0) + (_barePorts != null ? _barePorts.Count : 0);
+            if (GUILayout.Button("Refresh port list (" + count + ")"))
                 RefreshRecoveryPorts();
 
-            if (_recoveryPorts == null || _recoveryPorts.Count == 0)
+            if (count == 0)
             {
                 GUILayout.Label("Recovery ports not found (world still loading?)", _label);
                 return;
@@ -317,23 +324,114 @@ namespace SailwindCoop.Runtime
             foreach (var rp in _recoveryPorts)
             {
                 if (rp == null) continue;
-                if (GUILayout.Button(RecoveryPortName(rp)))
+                // The game has switched this recovery point off; the place itself is still there.
+                string off = rp.gameObject.activeInHierarchy ? "" : " (off in game)";
+                if (GUILayout.Button(RecoveryPortName(rp) + off))
                     TeleportToIsland(rp);
+            }
+            foreach (var port in _barePorts)
+            {
+                if (port == null) continue;
+                if (GUILayout.Button(SafePortName(port) + " (player only)"))
+                    TeleportPlayerToPort(port);
             }
             GUILayout.EndScrollView();
         }
 
+        // Ports the game gives no recovery point: there is no place to put a boat at.
+        private List<Port> _barePorts = new List<Port>();
+
+        /// <summary>
+        /// One entry per port of the game. A recovery point that the game has switched off is
+        /// listed too, so inactive objects are searched; a <c>RecoveryPort</c> without its port or
+        /// its boat place (the game has such leftovers on the port objects) is not a place to go.
+        /// </summary>
         private void RefreshRecoveryPorts()
         {
+            _recoveryPorts = new List<RecoveryPort>();
+            _barePorts = new List<Port>();
             try
             {
-                _recoveryPorts = new List<RecoveryPort>(UnityEngine.Object.FindObjectsOfType<RecoveryPort>());
+                var byPort = new Dictionary<Port, RecoveryPort>();
+                foreach (var rp in Resources.FindObjectsOfTypeAll<RecoveryPort>())
+                {
+                    // Not an asset: an object of a loaded scene.
+                    if (rp == null || !rp.gameObject.scene.IsValid() || rp.parentPort == null || rp.boatPos == null) continue;
+                    if (byPort.TryGetValue(rp.parentPort, out var known) && (known.gameObject.activeInHierarchy || !rp.gameObject.activeInHierarchy))
+                        continue;
+                    byPort[rp.parentPort] = rp;
+                }
+                _recoveryPorts.AddRange(byPort.Values);
                 _recoveryPorts.Sort((a, b) => string.CompareOrdinal(RecoveryPortName(a), RecoveryPortName(b)));
+
+                if (Port.ports != null)
+                    foreach (var port in Port.ports)
+                        if (port != null && !byPort.ContainsKey(port)) _barePorts.Add(port);
+                _barePorts.Sort((a, b) => string.CompareOrdinal(SafePortName(a), SafePortName(b)));
             }
             catch (Exception e)
             {
-                _recoveryPorts = new List<RecoveryPort>();
                 Plugin.Logger.LogWarning("[DebugPanel] recovery port list: " + e.Message);
+            }
+        }
+
+        private static string SafePortName(Port port)
+        {
+            try
+            {
+                string n = port.GetPortName();
+                if (!string.IsNullOrEmpty(n)) return n;
+            }
+            catch { }
+            return port != null ? port.name : "?";
+        }
+
+        private static FieldInfo _fHorizonHeight;
+
+        /// <summary>
+        /// How far below its place the game holds the island of <paramref name="t"/> right now.
+        /// A far island is sunk under the horizon (<c>IslandHorizon.ApplyNewHorizon</c>) with
+        /// everything parented to it and comes up when the player is near. A recovery point
+        /// usually leaves the island on Start, one that never started and the ports do not.
+        /// </summary>
+        private static float HorizonLift(Transform t)
+        {
+            try
+            {
+                var horizon = t != null ? t.GetComponentInParent<IslandHorizon>() : null;
+                if (horizon == null) return 0f;
+                if (_fHorizonHeight == null)
+                    _fHorizonHeight = typeof(IslandHorizon).GetField("initialHeight", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (_fHorizonHeight == null) return 0f;
+                return (float)_fHorizonHeight.GetValue(horizon) - horizon.transform.localPosition.y;
+            }
+            catch (Exception e)
+            {
+                Plugin.Logger.LogWarning("[DebugPanel] island height: " + e.Message);
+                return 0f;
+            }
+        }
+
+        /// <summary>A port without a recovery point: only a player on foot can be taken there.</summary>
+        private void TeleportPlayerToPort(Port port)
+        {
+            try
+            {
+                if (IsEmbarked())
+                {
+                    _status = SafePortName(port) + ": no boat place in the game, go ashore first";
+                    return;
+                }
+                Vector3 pos = port.transform.position + Vector3.up * (HorizonLift(port.transform) + 1f);
+                if (Refs.charController != null) Refs.charController.transform.position = pos;
+                if (Refs.observerMirror != null) Refs.observerMirror.transform.position = pos;
+                _status = "teleport -> " + SafePortName(port) + " (on foot)";
+                Plugin.Logger.LogInfo("[DebugPanel] teleport -> " + SafePortName(port) + " (port without a recovery point, on foot)");
+            }
+            catch (Exception e)
+            {
+                _status = "teleport: " + e.Message;
+                Plugin.Logger.LogWarning("[DebugPanel] teleport to port: " + e);
             }
         }
 
@@ -365,36 +463,21 @@ namespace SailwindCoop.Runtime
                     return;
                 }
 
-                if (hostAuthority)
+                // lastOwnedBoat is the boat root already, currentBoat is the hull under it.
+                Transform boat = hostAuthority
+                    ? BoatRoot(GameState.lastOwnedBoat != null ? GameState.lastOwnedBoat : GameState.currentBoat)
+                    : null;
+                var coop = CoopBehaviour.Instance;
+                if (boat != null && coop != null)
                 {
-                    // lastOwnedBoat is the boat root already, currentBoat is the hull under it.
-                    Transform boat = BoatRoot(GameState.lastOwnedBoat != null ? GameState.lastOwnedBoat : GameState.currentBoat);
-                    if (boat != null)
+                    if (_boatTeleport || GameState.recovering)
                     {
-                        try
-                        {
-                            ReleaseBoat(boat);
-                            boat.position = rp.GetBoatPos();
-                            if (rp.boatPos != null) boat.rotation = rp.boatPos.rotation;
-                        }
-                        catch (Exception be) { Plugin.Logger.LogWarning("[DebugPanel] boat teleport: " + be.Message); }
+                        _status = "teleport: a recovery or a teleport is still going on";
+                        return;
                     }
+                    coop.StartCoroutine(TeleportBoatLikeRecovery(coop, rp, boat, embarked));
                 }
-
-                if (!embarked)
-                {
-                    // Пеший игрок → точка спавна recovery-порта. charController — как ванильный
-                    // дебаг-телепорт Port.teleportPlayer (ovrController не трогаем: тип из Oculus.VR,
-                    // сборка не в референсах).
-                    Vector3 pos = rp.transform.position + Vector3.up * 1f;
-                    if (Refs.charController != null)
-                        Refs.charController.transform.position = pos;
-                    if (Refs.observerMirror != null)
-                    {
-                        Refs.observerMirror.transform.position = pos;
-                        Refs.observerMirror.transform.rotation = rp.transform.rotation;
-                    }
-                }
+                else if (!embarked) MovePlayerToPort(rp);
 
                 _status = "teleport -> " + RecoveryPortName(rp) + (embarked ? " (on boat)" : " (on foot)");
                 Plugin.Logger.LogInfo("[DebugPanel] teleport -> " + RecoveryPortName(rp) +
@@ -404,6 +487,93 @@ namespace SailwindCoop.Runtime
             {
                 _status = "teleport: " + e.Message;
                 Plugin.Logger.LogWarning("[DebugPanel] teleport to island: " + e);
+            }
+        }
+
+        /// <summary>A player on foot goes to the port's spawn point. charController, like the
+        /// game's own debug teleport <c>Port.teleportPlayer</c> (ovrController is an Oculus.VR
+        /// type, and that assembly is not referenced).</summary>
+        private static void MovePlayerToPort(RecoveryPort rp)
+        {
+            Vector3 pos = rp.transform.position + Vector3.up * (HorizonLift(rp.transform) + 1f);
+            if (Refs.charController != null)
+                Refs.charController.transform.position = pos;
+            if (Refs.observerMirror != null)
+            {
+                Refs.observerMirror.transform.position = pos;
+                Refs.observerMirror.transform.rotation = rp.transform.rotation;
+            }
+        }
+
+        private bool _boatTeleport;
+
+        // Longer than any island takes to load; the wait must not hold the recovery mode for ever.
+        private const float SceneWaitSec = 30f;
+
+        /// <summary>
+        /// The game's own way to move a boat to a port (<c>Recovery.RecoverBoat</c>,
+        /// <c>DebugBoatTeleporter.TeleportBoat</c>): under <c>GameState.recovering</c>, in stages
+        /// with physics steps between them, moored at the end. Under that flag the game shifts
+        /// the origin instantly by itself and <c>BoatPhysicsSwitcher</c> stays out of a stopped
+        /// world. The end is what <c>RecoveryPatches</c> does after the game's recovery: the
+        /// host's origin, the boats' state, the 1.5 s hold. The flag is dropped only after the
+        /// hold, as the game drops it seconds after the boat has arrived.
+        /// </summary>
+        private IEnumerator TeleportBoatLikeRecovery(CoopBehaviour coop, RecoveryPort rp, Transform boat, bool embarked)
+        {
+            _boatTeleport = true;
+            GameState.recovering = true;
+            try
+            {
+                var ropes = boat.GetComponent<BoatMooringRopes>();
+                ReleaseBoat(boat);
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForEndOfFrame();
+                yield return new WaitForEndOfFrame();
+                // The recovery watchdog, or a session torn down, has ended the mode: leave the boat.
+                if (!GameState.recovering || boat == null || rp == null) yield break;
+
+                if (!embarked) MovePlayerToPort(rp);
+                boat.position = rp.GetBoatPos() + Vector3.up * HorizonLift(rp.boatPos);
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForEndOfFrame();
+                yield return new WaitForEndOfFrame();
+                if (!GameState.recovering || boat == null || rp == null) yield break;
+
+                if (rp.boatPos != null) boat.rotation = rp.boatPos.rotation;
+                // A port without its moorings must not end the teleport half way: the rest
+                // (the origin, the resend, the hold) is still owed.
+                try
+                {
+                    if (ropes != null && rp.mooringFront != null) ropes.MoorClosestRope(rp.mooringFront);
+                    if (ropes != null && rp.mooringBack != null) ropes.MoorClosestRope(rp.mooringBack);
+                }
+                catch (Exception e) { Plugin.Logger.LogWarning("[DebugPanel] boat teleport, mooring: " + e.Message); }
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForEndOfFrame();
+                yield return new WaitForEndOfFrame();
+
+                // The island under the boat, as the game's recovery waits for it.
+                float until = Time.realtimeSinceStartup + SceneWaitSec;
+                while (GameState.loadingScenes > 0 && Time.realtimeSinceStartup < until)
+                    yield return new WaitForEndOfFrame();
+                if (!GameState.recovering) yield break;
+
+                Sync.OriginCatchUp.AlignToLoadedOffset();
+                coop.ResendBoatState();
+                Sync.OriginCatchUp.SettleHost();
+                while (coop.Pause != null && coop.Pause.Settling) yield return null;
+                yield return new WaitForFixedUpdate();
+                yield return new WaitForFixedUpdate();
+                Plugin.Logger.LogInfo("[DebugPanel] boat teleport done: " + RecoveryPortName(rp));
+            }
+            finally
+            {
+                _boatTeleport = false;
+                GameState.recovering = false;
             }
         }
 

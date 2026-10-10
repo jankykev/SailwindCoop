@@ -2,6 +2,17 @@
 
 All notable user-facing changes are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- The Debug panel's island teleport could capsize the host's boat and throw it away once the
+  game went on. The boat is now moved the way the game's own recovery moves it and ends up
+  moored at the port.
+- The Debug panel's island list missed five ports (Dragon Cliffs, Fort Aestrin, Serpent Isle,
+  Saffron Island, On'na) and had nine entries that led nowhere. Every port of the game is listed
+  now; On'na has no place for a boat in the game and takes a player on foot only.
+
 ## [0.5.2] - 2026-10-10
 
 The protocol is still 92, so 0.5.2 connects to 0.5.0 and 0.5.1. Update every machine anyway:
