@@ -11,6 +11,8 @@ All notable user-facing changes are documented in this file.
   moored at the port.
 - A guest's copy of a boat could take hits and waves over the side of its own and sink while the
   host's boat was whole. A guest's game no longer counts them; they come from the host.
+- When a guest broke the seal of a crate, the crate's contents window opened on the host's
+  screen and not on the guest's. It now opens for the player who unsealed the crate.
 - The Debug panel's island list missed five ports (Dragon Cliffs, Fort Aestrin, Serpent Isle,
   Saffron Island, On'na) and had nine entries that led nowhere. Every port of the game is listed
   now; On'na has no place for a boat in the game and takes a player on foot only.

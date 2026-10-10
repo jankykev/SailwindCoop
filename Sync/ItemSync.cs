@@ -181,6 +181,7 @@ namespace SailwindCoop.Sync
                 foreach (var state in new List<ItemStateMsg>(_pendingStates.Values))
                     if (TryApplyItemState(state) == ItemApplyStatus.Applied) _pendingStates.Remove(state.InstanceId);
             if (_net.Role == Role.Client && _pendingMissionGoods.Count != 0) RetryMissionGoods();
+            TickUnsealedCrate();
             SendLocalHeldPose(dt);
             TickInstruments(dt);
             TickOperations();
@@ -561,8 +562,12 @@ namespace SailwindCoop.Sync
                 var crate = ce != null ? ce.Item as ShipItemCrate : null;
                 if (crate != null)
                 {
+                    // UnsealCrate ends by opening the crate window (OpenAfterDelay) — on this machine, in
+                    // front of the host's camera. The window belongs to the client that unsealed it.
+                    RemoteUnseal = true;
                     try { crate.UnsealCrate(); }   // amount decrements synchronously; items insert next frame (coroutine)
                     catch (Exception ex) { Plugin.Logger.LogWarning("[ItemSync] UnsealCrate: " + ex.Message); }
+                    finally { RemoteUnseal = false; }
                     // Broadcast the crate's new amount now. The contained items are authored across the next
                     // frames (InsertItem coroutine sets currentCrateId); the periodic RefreshItems then
                     // broadcasts them as SpawnObject WITH their CrateId — so we deliberately don't force a
@@ -1636,6 +1641,32 @@ namespace SailwindCoop.Sync
         // Anti-echo: set while we apply a remote crate change, so the Insert/Withdraw postfix patches
         // don't re-forward it (R13). Static because the patches are static.
         internal static bool ApplyingCrate;
+        // Set while the host runs UnsealCrate for a client: the OpenAfterDelay prefix then starts nothing.
+        internal static bool RemoteUnseal;
+
+        // Client: the crate it unsealed. Vanilla is skipped there, so its window is opened here once
+        // the host's contents have arrived.
+        private ShipItemCrate _unsealedCrate;
+        private int _unsealedCount;
+        private float _unsealedDeadline;
+        private const float UnsealOpenWait = 5f;
+        private const float UnsealOpenReach = 3f;
+
+        private void TickUnsealedCrate()
+        {
+            if (ReferenceEquals(_unsealedCrate, null)) return;
+            var crate = _unsealedCrate;
+            var inventory = crate != null ? crate.GetComponent<CrateInventory>() : null;
+            bool late = Time.unscaledTime > _unsealedDeadline;
+            if (inventory == null || (late && crate.amount > 0f)) { _unsealedCrate = null; return; }
+            if (crate.amount > 0f || (!late && inventory.containedItems.Count < _unsealedCount)) return;
+            _unsealedCrate = null;
+            var cam = Camera.main;
+            if (cam == null || crate.held != null ||
+                Vector3.Distance(cam.transform.position, crate.transform.position) > UnsealOpenReach) return;
+            try { inventory.OpenCrate(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning("[ItemSync] OpenCrate after unseal: " + ex.Message); }
+        }
 
         /// <summary>
         /// Mirror a crate membership change onto a local item: withdraw it from its old crate and/or
@@ -2395,6 +2426,10 @@ namespace SailwindCoop.Sync
                 PrefabIndex = sv.prefabIndex,
             }, LiteNetLib.DeliveryMethod.ReliableOrdered);
             Remember("out unseal crate id=" + sv.instanceId);
+            _unsealedCrate = crate;
+            _unsealedCount = (int)crate.amount;
+            _unsealedDeadline = Time.unscaledTime + UnsealOpenWait;
+            try { UISoundPlayer.instance.PlayUISound(UISounds.crateSealBreak, 1f, 1f); } catch { }
             return true;
         }
 
@@ -3537,6 +3572,7 @@ namespace SailwindCoop.Sync
             _tombstones.Clear();
             _pendingStates.Clear();
             _crateMembership.Clear();
+            _unsealedCrate = null;
             _cargoMembership.Clear();
             _pendingSpawns.Clear();
             _spawnWait.Clear();
