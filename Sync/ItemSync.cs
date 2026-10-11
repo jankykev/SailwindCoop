@@ -517,6 +517,13 @@ namespace SailwindCoop.Sync
                 if (placedAttach) MoveItemToProxy(item);
                 if (LocalPlayerBoat() == null)
                     EnsureWorldParentState(item);
+                // The game drops from inside GoPointer.LateUpdate, right after it turned the item to
+                // the pointer: a mug or a bowl is then tilted by the pitch of the camera, and its
+                // own ExtraLateUpdate, which holds it upright, has not run and will not (it is no
+                // longer held). The game goes on from the proxy, which has the upright pose; a held
+                // item here is a puppet with a stale proxy, so the pose the player saw is put back.
+                if (!placedAttach && ReferenceEquals(_seenHeld, item) && _seenHeldFrame == Time.frameCount)
+                    item.transform.rotation = _seenHeldRot;
                 if (!placedAttach)
                     MoveProxyToItem(item, kinematic: true, Vector3.zero);
                 var msg = BuildRequest(e, ItemAction.Drop, _net.Clock.ServerTick);
@@ -989,15 +996,22 @@ namespace SailwindCoop.Sync
             }
         }
 
+        private ShipItem _seenHeld;
+        private Quaternion _seenHeldRot;
+        private int _seenHeldFrame = -1;
         private void SendLocalHeldPose(float dt)
         {
             if (_net.Role != Role.Client || _net.State != LinkState.Connected) return;
+            var held = HeldItem() as ShipItem;
+            // Every frame, not at the pose rate: what the player saw last frame, after every
+            // LateUpdate (see NotifyDrop).
+            _seenHeld = held; _seenHeldFrame = Time.frameCount;
+            if (held != null) _seenHeldRot = held.transform.rotation;
             float interval = 1f / Mathf.Max(1f, HeldPoseHz);
             _heldPoseTimer += dt;
             if (_heldPoseTimer < interval) return;
             _heldPoseTimer = 0f;
 
-            var held = HeldItem() as ShipItem;
             if (held != null) StreamLocalPose(held);
 
             // Items the local player tucked into a personal belt slot (GPButtonInventorySlot) are no longer
