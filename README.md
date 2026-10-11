@@ -1,4 +1,11 @@
-# Sailwind LAN Co-op Mod
+# ⚓ Sailwind LAN Co-op Mod
+
+[![Version](https://img.shields.io/github/v/release/pander33/SailwindCoop?label=version&color=blue)](https://github.com/pander33/SailwindCoop/releases/latest)
+[![Game](https://img.shields.io/badge/game-Sailwind-1b2838?logo=steam&logoColor=white)](https://store.steampowered.com/app/1764530/)
+[![BepInEx](https://img.shields.io/badge/BepInEx-5.x-orange)](https://github.com/BepInEx/BepInEx/releases)
+[![Players](https://img.shields.io/badge/players-2--5-brightgreen)](#-features)
+[![Status](https://img.shields.io/badge/status-early%20development-yellow)](#-notes)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [English](#english) | [Русский](#русский)
 
