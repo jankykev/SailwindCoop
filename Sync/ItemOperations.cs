@@ -6,17 +6,57 @@ namespace SailwindCoop.Sync
 {
     public sealed partial class ItemSync
     {
-        private float _lastPipeRequest;
         internal bool IsSessionActive => _net.State == LinkState.Connected && _net.Role != Role.None;
         internal bool IsRemoteSimulationItem(ShipItem item) => IsClientSession && item != null && _hostIds.Contains(InstanceIdOf(item));
         internal void NotifyPipeUse(ShipItem item)
         {
-            if (InteractionContext.Suppressed || UnityEngine.Time.unscaledTime - _lastPipeRequest < 0.25f) return;
-            if (!_byItem.TryGetValue(item, out var entry)) return;
-            _lastPipeRequest = UnityEngine.Time.unscaledTime;
+            // The same mark as a pot: the state after the last puff must go out too.
+            if (InteractionContext.Suppressed) return;
+            _drainItem = item;
+        }
+        /// <summary>Client: the item in the local hand is simulated here (a pipe smoked, a pot
+        /// emptied) and its state is reported to the host. The host's copy is older than the hand
+        /// by a round trip, so <see cref="TryApplyItemState"/> takes only the world's values from it.</summary>
+        private void SendHolderReport(ItemEntry entry)
+        {
             var request = BuildRequest(entry, ItemAction.State, _net.Clock.ServerTick);
             request.IsInteraction = false;
+            entry.HolderReport = request.RequestId;
             _net.Broadcast(request, LiteNetLib.DeliveryMethod.ReliableOrdered);
+        }
+        private const float DrainSendInterval = 0.2f;
+        private ShipItem _drainItem;
+        private float _lastDrainSent;
+        /// <summary>A tilted pot is emptied by one machine: the one whose player holds it, or the host
+        /// for a pot in nobody's hand. The game itself runs the spill wherever the pot is seen tilted.</summary>
+        internal bool OwnsDrain(ShipItem item)
+        {
+            if (LocalHand(item)) return true;
+            if (!_byItem.TryGetValue(item, out var entry)) return true; // not a shared item
+            if (_net.Role == Role.Client) return !_hostIds.Contains(entry.InstanceId);
+            return entry.HolderNetId == 0;
+        }
+        /// <summary>The pot's level changed here. The host's change goes out with its item state
+        /// stream; a client reports its own a few times a second (<see cref="TickDrain"/>).</summary>
+        internal void NotifyDrain(ShipItem item)
+        {
+            if (InteractionContext.Suppressed || ItemOperationCapture.Absorb() || !IsClientSession) return;
+            _drainItem = item;
+        }
+        private void TickDrain()
+        {
+            var item = _drainItem;
+            if (item == null) { _drainItem = null; return; }
+            // The mark stays until it is sent, so the level after the last sip always goes out.
+            if (UnityEngine.Time.unscaledTime - _lastDrainSent < DrainSendInterval) return;
+            _drainItem = null;
+            // A pot already dropped went out with its level in the Drop; a State after it would
+            // put the falling pot back at the hand. One put on the belt is still this player's,
+            // and the request that put it there carries no level.
+            if (!LocalHand(item) && !InPersonalInventory(item)) return;
+            if (!_byItem.TryGetValue(item, out var entry) || !_hostIds.Contains(entry.InstanceId)) return;
+            _lastDrainSent = UnityEngine.Time.unscaledTime;
+            SendHolderReport(entry);
         }
         private bool _operationApplying;
         private readonly HashSet<ShipItem> _destroyingItems = new HashSet<ShipItem>();
@@ -438,6 +478,7 @@ namespace SailwindCoop.Sync
         {
             if (_net.Role == Role.Client)
             {
+                TickDrain();
                 // Only results still waiting for a target; finished ones stay in _receivedOperations
                 // as the duplicate filter and are never walked again.
                 for (int i = _unfinishedResults.Count - 1; i >= 0; i--)
@@ -455,7 +496,7 @@ namespace SailwindCoop.Sync
         }
         private void ClearOperations()
         {
-            _lastPipeRequest = 0f; _operationApplying = false; _operationResults.Clear(); _waitingOperations.Clear(); _operationLocalCreated.Clear();
+            _drainItem = null; _lastDrainSent = 0f; _operationApplying = false; _operationResults.Clear(); _waitingOperations.Clear(); _operationLocalCreated.Clear();
             _receivedOperations.Clear(); _unfinishedResults.Clear(); _destroyingItems.Clear();
             ItemOperationCapture.Clear();
         }

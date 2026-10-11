@@ -85,7 +85,11 @@ namespace SailwindCoop.Sync
                         ItemSync.Instance?.NotifyPipeUse(__state.Item);
                     return;
                 }
-                if (__instance is CookableFood) ItemComponents.Set(__instance, "currentHeat", __state.Heat);
+                if (__instance is CookableFood)
+                {
+                    ItemComponents.Set(__instance, "currentHeat", __state.Heat);
+                    if (__instance is CookableFoodKettle kettle) ItemComponents.BoilSound(kettle);
+                }
                 else if (__instance is ShipItemStove) ItemComponents.Set(__instance, "currentHeat", __state.Heat);
                 else if (__instance is ShipItemLight light) LightSync.ApplyState(light, __state.LightOn, __state.Health);
                 else if (__instance is StoveFuel) __state.Item.health = __state.Health;

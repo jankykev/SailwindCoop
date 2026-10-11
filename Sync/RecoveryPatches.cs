@@ -68,6 +68,10 @@ namespace SailwindCoop.Sync
         /// </summary>
         internal static void Cancel() => _generation++;
 
+        /// <summary>Moves on with every recovery the game starts and with every <see cref="Cancel"/>:
+        /// who took <c>GameState.recovering</c> for itself can tell that the flag is no longer its own.</summary>
+        internal static int Generation => _generation;
+
         // The game works the fee's share out where the player passed out, before it moves him.
         private static void PreRecover()
         {
@@ -137,10 +141,18 @@ namespace SailwindCoop.Sync
                 // The host's boat stands in the port now, with whoever was aboard.
                 if (!HostWithCrew) return;
                 Plugin.Logger.LogInfo("[Recovery] host boat recovered: settling the world and resending the boats' state");
-                OriginCatchUp.AlignToLoadedOffset();
-                CoopBehaviour.Instance.ResendBoatState();
-                OriginCatchUp.SettleHost();
+                SettleMovedBoat();
             }, Report);
+        }
+
+        /// <summary>Host, after its boat was put somewhere else in one move (the game's recovery,
+        /// the Debug teleport): the origin a client ends on, every change-only stream again, and
+        /// the 1.5 s hold of the world.</summary>
+        internal static void SettleMovedBoat()
+        {
+            OriginCatchUp.AlignToLoadedOffset();
+            CoopBehaviour.Instance.ResendBoatState();
+            OriginCatchUp.SettleHost();
         }
 
         private static void PreLogFee(DayLog __instance, ref int price)

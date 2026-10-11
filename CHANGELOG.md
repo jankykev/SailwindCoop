@@ -11,6 +11,14 @@ All notable user-facing changes are documented in this file.
   moored at the port.
 - A guest's copy of a boat could take hits and waves over the side of its own and sink while the
   host's boat was whole. A guest's game no longer counts them; they come from the host.
+- Firewood put into a stove stayed a loose item for everyone but the player who put it in: it
+  lay beside the stove, could be picked up while burning and did not move with the stove. It now
+  sits inside the stove for every player.
+- A pot of soup tilted in one player's hands was also spilled by every other player's game that
+  saw it, so it emptied faster than it should. Eating soup could also drop the frame rate.
+- A guest now hears a kettle boil, and a stove's "1 / 1" firewood text is the same for everyone.
+- Much less network traffic with food aboard: every piece of food and every burning lamp used to
+  be sent to all players twice a second for the whole session.
 - When a guest broke the seal of a crate, the crate's contents window opened on the host's
   screen and not on the guest's. It now opens for the player who unsealed the crate.
 - The Debug panel's island list missed five ports (Dragon Cliffs, Fort Aestrin, Serpent Isle,

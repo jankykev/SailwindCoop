@@ -221,10 +221,15 @@ namespace SailwindCoop.Sync
             _resyncAsked = true;
             _net.Broadcast(new ResyncRequestMsg { BoatIndex = _boatId, Domain = ResyncDomain.Damage }, LiteNetLib.DeliveryMethod.ReliableOrdered);
         }
+        /// <summary>The state is sent on change; this often it also goes out unchanged, so a copy
+        /// that came apart from the host's for any reason does not stay so.</summary>
+        private const float RefreshSeconds = 30f;
+        private float _refreshTimer;
         private void SendSnapshot(float dt)
         {
             if (_damage == null) return;
 
+            _refreshTimer += dt;
             float interval = 1f / Mathf.Max(0.5f, SnapshotHz);
             _sendTimer += dt;
             if (_sendTimer < interval) return;
@@ -235,6 +240,7 @@ namespace SailwindCoop.Sync
                 !_damage.oakum.Equals(_sentOakum) || !_damage.waterIntakeChunk.Equals(_sentIntake) || _damage.sunk != _sentSunk;
             var mode = _stream.Next(changed);
             if (mode != StreamSend.None) BroadcastSnapshot(mode == StreamSend.Reliable, periodic: true);
+            else if (_refreshTimer >= RefreshSeconds) BroadcastSnapshot(reliable: true, periodic: true);
         }
 
         internal BoatDamageStateMsg OperationState(ushort boatId)
@@ -270,6 +276,7 @@ namespace SailwindCoop.Sync
             if (!periodic) _stream.Sent(reliable);
             _sentWater = state.WaterLevel; _sentHull = state.HullDamage; _sentOakum = state.Oakum;
             _sentIntake = state.WaterIntakeChunk; _sentSunk = state.Sunk;
+            _refreshTimer = 0f;
             _net.Broadcast(state, reliable ? LiteNetLib.DeliveryMethod.ReliableOrdered : LiteNetLib.DeliveryMethod.Unreliable);
         }
 
@@ -393,54 +400,84 @@ namespace SailwindCoop.Sync
             bool oakumAlt = TryPatch(harmony, typeof(ShipItemOakum), "OnAltActivate", System.Type.EmptyTypes,
                 nameof(PreOakumAlt), nameof(PostOakumAlt));
 
-            bool impact = TryPrefix(harmony, "Impact", new[] { typeof(Collider), typeof(float) }, nameof(PreClientImpact));
-            bool overflow = TryPrefix(harmony, "Overflow", new[] { typeof(float) }, nameof(PreClientOverflow));
+            bool impact = TryPatch(harmony, typeof(BoatDamage), "Impact", new[] { typeof(Collider), typeof(float) }, nameof(PreClientImpact), null);
+            bool overflow = TryPatch(harmony, typeof(BoatDamage), "Overflow", new[] { typeof(float) }, nameof(PreClientOverflow), null);
+            bool update = TryPatch(harmony, typeof(BoatDamage), "Update", System.Type.EmptyTypes, nameof(PreClientUpdate), nameof(PostClientUpdate));
+            bool daily = TryPatch(harmony, typeof(BoatDamage), "DailyDamage", System.Type.EmptyTypes, nameof(PreClientDailyDamage), null);
 
             Plugin.Logger.LogInfo("[BoatDamagePatches] Damage patches: HullOakum=" + hull +
                                   ", WaterBail=" + water + ", OakumAlt=" + oakumAlt +
-                                  ", ClientImpact=" + impact + ", ClientOverflow=" + overflow);
+                                  ", ClientImpact=" + impact + ", ClientOverflow=" + overflow +
+                                  ", ClientUpdate=" + update + ", ClientDailyDamage=" + daily);
             SailwindCoop.Runtime.PatchHealth.Report("Damage", (hull ? 1 : 0) + (water ? 1 : 0) + (oakumAlt ? 1 : 0) +
-                                                              (impact ? 1 : 0) + (overflow ? 1 : 0), 5);
+                                                              (impact ? 1 : 0) + (overflow ? 1 : 0) +
+                                                              (update ? 1 : 0) + (daily ? 1 : 0), 7);
         }
 
-        private static bool TryPrefix(Harmony harmony, string method, System.Type[] args, string prefixName)
+        private struct ClientWater
+        {
+            public bool Captured;
+            public float Water, Intake;
+        }
+
+        // The game's own leak, rain and drain (BoatDamage.UpdateWaterAndDrag) run on the client's
+        // copy too, and the leak only for the boat this machine's player sails: a guest alone on a
+        // boat would fill and sink a copy the host keeps dry. The rest of Update (drag, buoyancy,
+        // the sinking itself) still runs, from the host's water. No closure: this is every frame.
+        private static void PreClientUpdate(BoatDamage __instance, out ClientWater __state)
+        {
+            __state = default(ClientWater);
+            try
+            {
+                if (!ClientCopy(__instance)) return;
+                __state.Captured = true; __state.Water = __instance.waterLevel; __state.Intake = __instance.waterIntakeChunk;
+            }
+            catch (System.Exception e) { WarnPatch("[BoatDamagePatches] PreClientUpdate: " + e.Message); }
+        }
+
+        private static void PostClientUpdate(BoatDamage __instance, ClientWater __state)
         {
             try
             {
-                var mi = typeof(BoatDamage).GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, args, null);
-                if (mi == null)
-                {
-                    WarnPatch("[BoatDamagePatches] Not found BoatDamage." + method);
-                    return false;
-                }
-                harmony.Patch(mi, prefix: new HarmonyMethod(typeof(BoatDamagePatches).GetMethod(prefixName, BindingFlags.Static | BindingFlags.NonPublic)));
-                return true;
+                if (!__state.Captured || __instance == null) return;
+                // The game's own limits stay: a guest's pump on a dry hull takes the level below zero.
+                __instance.waterLevel = Mathf.Clamp01(__state.Water); __instance.waterIntakeChunk = __state.Intake;
             }
-            catch (System.Exception e)
-            {
-                WarnPatch("[BoatDamagePatches] BoatDamage." + method + ": " + e.Message);
-                return false;
-            }
+            catch (System.Exception e) { WarnPatch("[BoatDamagePatches] PostClientUpdate: " + e.Message); }
+        }
+
+        // The daily wear of oakum and hull belongs to the host's boat.
+        private static bool PreClientDailyDamage(BoatDamage __instance)
+        {
+            try { return !ClientCopy(__instance); }
+            catch (System.Exception e) { WarnPatch("[BoatDamagePatches] PreClientDailyDamage: " + e.Message); return true; }
         }
 
         // The host owns hull damage and water. A client's copy of the boat still has a body under
         // this machine's physics, so the game would count that copy's own hits and water over the
         // side; state comes only when the host's changes, and such damage would stay.
+        // No closures here: these run on every machine, the second one possibly every physics step.
         private static bool PreClientImpact(BoatDamage __instance)
-            => SailwindCoop.Runtime.PatchGuard.Prefix(() =>
+        {
+            try
             {
                 if (!ClientCopy(__instance)) return true;
                 BoatSync.IgnoredImpacts++;
                 return false;
-            }, e => WarnPatch("[BoatDamagePatches] PreClientImpact: " + e.Message));
+            }
+            catch (System.Exception e) { WarnPatch("[BoatDamagePatches] PreClientImpact: " + e.Message); return true; }
+        }
 
         private static bool PreClientOverflow(BoatDamage __instance)
-            => SailwindCoop.Runtime.PatchGuard.Prefix(() =>
+        {
+            try
             {
                 if (!ClientCopy(__instance)) return true;
                 BoatSync.IgnoredOverflows++;
                 return false;
-            }, e => WarnPatch("[BoatDamagePatches] PreClientOverflow: " + e.Message));
+            }
+            catch (System.Exception e) { WarnPatch("[BoatDamagePatches] PreClientOverflow: " + e.Message); return true; }
+        }
 
         private static bool ClientCopy(BoatDamage damage)
         {
@@ -459,7 +496,8 @@ namespace SailwindCoop.Sync
                     return false;
                 }
                 var prefix = new HarmonyMethod(typeof(BoatDamagePatches).GetMethod(prefixName, BindingFlags.Static | BindingFlags.NonPublic));
-                var postfix = new HarmonyMethod(typeof(BoatDamagePatches).GetMethod(postfixName, BindingFlags.Static | BindingFlags.NonPublic));
+                var postfix = postfixName == null ? null
+                    : new HarmonyMethod(typeof(BoatDamagePatches).GetMethod(postfixName, BindingFlags.Static | BindingFlags.NonPublic));
                 harmony.Patch(mi, prefix: prefix, postfix: postfix);
                 return true;
             }

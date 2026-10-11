@@ -423,9 +423,7 @@ namespace SailwindCoop.Runtime
                     _status = SafePortName(port) + ": no boat place in the game, go ashore first";
                     return;
                 }
-                Vector3 pos = port.transform.position + Vector3.up * (HorizonLift(port.transform) + 1f);
-                if (Refs.charController != null) Refs.charController.transform.position = pos;
-                if (Refs.observerMirror != null) Refs.observerMirror.transform.position = pos;
+                MovePlayerTo(port.transform, turn: false);
                 _status = "teleport -> " + SafePortName(port) + " (on foot)";
                 Plugin.Logger.LogInfo("[DebugPanel] teleport -> " + SafePortName(port) + " (port without a recovery point, on foot)");
             }
@@ -494,15 +492,17 @@ namespace SailwindCoop.Runtime
         /// <summary>A player on foot goes to the port's spawn point. charController, like the
         /// game's own debug teleport <c>Port.teleportPlayer</c> (ovrController is an Oculus.VR
         /// type, and that assembly is not referenced).</summary>
-        private static void MovePlayerToPort(RecoveryPort rp)
+        private static void MovePlayerToPort(RecoveryPort rp) => MovePlayerTo(rp.transform, turn: true);
+
+        private static void MovePlayerTo(Transform place, bool turn)
         {
-            Vector3 pos = rp.transform.position + Vector3.up * (HorizonLift(rp.transform) + 1f);
+            Vector3 pos = place.position + Vector3.up * (HorizonLift(place) + 1f);
             if (Refs.charController != null)
                 Refs.charController.transform.position = pos;
             if (Refs.observerMirror != null)
             {
                 Refs.observerMirror.transform.position = pos;
-                Refs.observerMirror.transform.rotation = rp.transform.rotation;
+                if (turn) Refs.observerMirror.transform.rotation = place.rotation;
             }
         }
 
@@ -524,6 +524,9 @@ namespace SailwindCoop.Runtime
         {
             _boatTeleport = true;
             GameState.recovering = true;
+            // A recovery of the game started meanwhile takes the flag over: it is then the game's
+            // to clear, and this teleport must leave the boat to it.
+            int recovery = Sync.RecoveryPatches.Generation;
             try
             {
                 var ropes = boat.GetComponent<BoatMooringRopes>();
@@ -533,7 +536,7 @@ namespace SailwindCoop.Runtime
                 yield return new WaitForEndOfFrame();
                 yield return new WaitForEndOfFrame();
                 // The recovery watchdog, or a session torn down, has ended the mode: leave the boat.
-                if (!GameState.recovering || boat == null || rp == null) yield break;
+                if (!GameState.recovering || recovery != Sync.RecoveryPatches.Generation || boat == null || rp == null) yield break;
 
                 if (!embarked) MovePlayerToPort(rp);
                 boat.position = rp.GetBoatPos() + Vector3.up * HorizonLift(rp.boatPos);
@@ -541,7 +544,7 @@ namespace SailwindCoop.Runtime
                 yield return new WaitForFixedUpdate();
                 yield return new WaitForEndOfFrame();
                 yield return new WaitForEndOfFrame();
-                if (!GameState.recovering || boat == null || rp == null) yield break;
+                if (!GameState.recovering || recovery != Sync.RecoveryPatches.Generation || boat == null || rp == null) yield break;
 
                 if (rp.boatPos != null) boat.rotation = rp.boatPos.rotation;
                 // A port without its moorings must not end the teleport half way: the rest
@@ -561,11 +564,9 @@ namespace SailwindCoop.Runtime
                 float until = Time.realtimeSinceStartup + SceneWaitSec;
                 while (GameState.loadingScenes > 0 && Time.realtimeSinceStartup < until)
                     yield return new WaitForEndOfFrame();
-                if (!GameState.recovering) yield break;
+                if (!GameState.recovering || recovery != Sync.RecoveryPatches.Generation) yield break;
 
-                Sync.OriginCatchUp.AlignToLoadedOffset();
-                coop.ResendBoatState();
-                Sync.OriginCatchUp.SettleHost();
+                Sync.RecoveryPatches.SettleMovedBoat();
                 while (coop.Pause != null && coop.Pause.Settling) yield return null;
                 yield return new WaitForFixedUpdate();
                 yield return new WaitForFixedUpdate();
@@ -574,7 +575,7 @@ namespace SailwindCoop.Runtime
             finally
             {
                 _boatTeleport = false;
-                GameState.recovering = false;
+                if (recovery == Sync.RecoveryPatches.Generation) GameState.recovering = false;
             }
         }
 

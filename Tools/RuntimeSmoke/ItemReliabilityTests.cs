@@ -4,12 +4,48 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using Mono.Cecil;
+using SailwindCoop.Net;
 using SailwindCoop.Sync;
 
 internal static class ItemReliabilityTests
 {
     internal static void Run(Action<string, Action> test)
     {
+        test("food ageing is sent by visible steps and at the marks the game reads", () => {
+            // One frame of spoiling is not a change; a whole life of it is about a hundred.
+            int sends = 0; float sent = 0f;
+            for (float now = 0f; now < 0.85f; now += 0.00003f)
+                if (ItemAgeing.Spoiled(sent, now)) { sends++; sent = now; }
+            Assert(sends >= 80 && sends <= 90, "spoiling 0 to 0.85 sent " + sends + " times");
+            Assert(!ItemAgeing.Spoiled(0.5f, 0.5049f) && ItemAgeing.Spoiled(0.5f, 0.511f), "wrong step");
+            Assert(ItemAgeing.Spoiled(0.1999f, 0.2f), "fresh label mark missed");
+            Assert(ItemAgeing.Spoiled(0.9f, 0.90001f), "rotten mark missed: the game tests > 0.9");
+            Assert(!ItemAgeing.Spoiled(0.95f, 0.9515f) && ItemAgeing.Spoiled(0.95f, 0.9525f), "rotten range needs the finer step");
+            Assert(ItemAgeing.Spoiled(0.9995f, 1f), "fully spoiled mark missed");
+            Assert(!ItemAgeing.Spoiled(1.2f, 1.25f) && ItemAgeing.Spoiled(1.2f, 1.31f) && ItemAgeing.Spoiled(3f, 3.5f),
+                "spoiling past 1 still goes into a soup: sent by a coarse step");
+            Assert(!ItemAgeing.Heat(1.5f, 1.49f) && ItemAgeing.Heat(1.5f, 1.47f) && ItemAgeing.Heat(1.001f, 0.999f) &&
+                ItemAgeing.Heat(0.501f, 0.5f) && ItemAgeing.Heat(0.001f, 0f) && !ItemAgeing.Heat(0f, 0f), "cooling food and kettle");
+            Assert(ItemAgeing.Dried(0.6999f, 0.7001f) && ItemAgeing.Dried(0.985f, 0.99f) && ItemAgeing.Dried(0.999f, 1f), "dried marks missed");
+            Assert(ItemAgeing.Dried(0.004f, 0f) && !ItemAgeing.Dried(0.3f, 0.305f) && !ItemAgeing.Dried(1f, 1f), "dried limits");
+            Assert(!ItemAgeing.SoupSpoiled(10f, 10.4f, 100f) && ItemAgeing.SoupSpoiled(10f, 11.1f, 100f), "soup spoiling is a share of its energy");
+            Assert(ItemAgeing.SoupSpoiled(89.9f, 90.1f, 100f) && !ItemAgeing.SoupSpoiled(0f, 0f, 0f) && ItemAgeing.SoupSpoiled(0f, 1f, 0f), "soup marks");
+            Assert(!ItemAgeing.Fuel(200f, 198.5f) && ItemAgeing.Fuel(200f, 197.9f) && ItemAgeing.Fuel(0.5f, 0f), "burning log");
+            // A report from a hand: the soup's spoiling is the host's, lowered by the energy that left the pot.
+            var hostPot = new ItemDetails { RecipeKind = 1, Energy = 0.6f, UncookedEnergy = 0.2f, SoupSpoiled = 0.5f };
+            var handPot = new ItemDetails { RecipeKind = 1, Energy = 0.6f, UncookedEnergy = 0.2f, SoupSpoiled = 0.1f };
+            handPot.TakeWorldOwned(hostPot);
+            Assert(handPot.SoupSpoiled.Equals(0.5f), "a pot nobody drank from keeps the host's spoiling");
+            handPot.Energy = 0.45f; handPot.UncookedEnergy = 0.15f; handPot.TakeWorldOwned(hostPot);
+            Assert(Math.Abs(handPot.SoupSpoiled - 0.4f) < 1e-5f, "a sip lowers the host's spoiling by the energy drunk");
+            // What is neither a burning log nor a burning lamp is a player's change: exact.
+            Assert(ItemAgeing.Health(5f, 4.999f, false, 0f) && !ItemAgeing.Health(5f, 5f, false, 0f), "health of an ordinary item is exact");
+            Assert(!ItemAgeing.Health(200f, 198.5f, true, 0f) && ItemAgeing.Health(200f, 197.9f, true, 0f), "health of a burning log goes by steps");
+            Assert(!ItemAgeing.Health(50f, 49.8f, false, 100f) && ItemAgeing.Health(50f, 49.4f, false, 100f) &&
+                ItemAgeing.Health(50f, 80f, false, 100f), "health of a burning lamp goes by percents; a refill is seen");
+            Assert(!ItemAgeing.Lamp(50f, 49.8f, 100f) && ItemAgeing.Lamp(50f, 49.4f, 100f) && ItemAgeing.Lamp(0.2f, 0f, 100f) &&
+                !ItemAgeing.Lamp(0f, 0f, 100f) && ItemAgeing.Lamp(5f, 4.9f, 0f), "burning lamp: whole percents of its full fuel");
+        });
         test("authored same-prefab results bind by request even when reordered", () => {
             var authoring = new ItemAuthoring<object>(); var first = new object(); var second = new object();
             authoring.Add(41, first, 12); authoring.Add(42, second, 12);

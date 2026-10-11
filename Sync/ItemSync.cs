@@ -44,6 +44,77 @@ namespace SailwindCoop.Sync
             public ItemStateMsg LastSemantic;
             public readonly ItemStateGate Gate = new ItemStateGate();
             public readonly ItemRequestOrder Requests = new ItemRequestOrder();
+            public StoveFuel Fuel;
+            public bool FuelResolved;
+            public float LampFull;
+            public bool LampResolved;
+            /// <summary>Client: the last report of this item from the local hand (SendHolderReport).</summary>
+            public uint HolderReport;
+        }
+
+        /// <summary>
+        /// Host, for a drop and for a report from a hand (SendHolderReport). Drying, spoiling, the
+        /// heat left after the stove and the fuel of a burning lamp or log are moved by the host's
+        /// world alone; a guest's copy gets them by steps (<see cref="ItemAgeing"/>) and neither a
+        /// drop nor a hand report changes them. So these requests do not carry them: the host
+        /// keeps its own, otherwise every sip from a pot would take its cooling a step back.
+        /// A soup's spoiling is the host's as well, lowered by what left the pot
+        /// (<see cref="ItemDetails.TakeWorldOwned"/>).
+        /// Returns the health to apply.
+        /// </summary>
+        private static float KeepWorldOwned(ShipItem item, ItemDetails incoming, float health)
+        {
+            if (item == null || incoming == null) return health;
+            try
+            {
+                incoming.TakeWorldOwned(ItemComponents.Capture(item));
+                if (item is ShipItemLight light && LightSync.IsOn(light)) return item.health;
+                var fuel = item.GetComponent<StoveFuel>();
+                if (fuel != null && ItemComponents.Read<bool>(fuel, "lit")) return item.health;
+            }
+            catch (Exception error) { Plugin.Logger.LogWarning("[ItemSync] KeepWorldOwned: " + error.Message); }
+            return health;
+        }
+
+        /// <summary>Client, for the item in the local hand that this hand reports
+        /// (<see cref="KeepWorldOwned"/> is the host's side): of a host state only the values of
+        /// the host's world are taken; the rest is the hand's own and newer than any echo.</summary>
+        private static void ApplyWorldOwned(ShipItem item, ItemDetails state)
+        {
+            if (item == null || state == null) return;
+            try
+            {
+                // The fields of ItemDetails.TakeWorldOwned, written to the game's components.
+                var food = item.GetComponent<FoodState>();
+                if (food != null && state.HasFood) { food.dried = state.Dried; food.spoiled = state.Spoiled; }
+                var cook = item.GetComponent<CookableFood>();
+                if (cook != null && state.HasCookable) ItemComponents.Set(cook, "currentHeat", state.CookHeat);
+                if (item is ShipItemSoup soup && state.RecipeKind == 1) soup.currentSpoiled = state.SoupSpoiled;
+            }
+            catch (Exception error) { Plugin.Logger.LogWarning("[ItemSync] ApplyWorldOwned: " + error.Message); }
+        }
+        /// <summary>The full fuel of a lamp (private <c>ShipItemLight.initialHealth</c>), 0 for any
+        /// other item or when the game no longer has the field.</summary>
+        private static float LampFull(ItemEntry e)
+        {
+            if (e.LampResolved) return e.LampFull;
+            e.LampResolved = true; e.LampFull = 0f;
+            if (e.Item is ShipItemLight light)
+            {
+                try { e.LampFull = ItemComponents.Read<float>(light, "initialHealth"); }
+                catch (Exception error) { Plugin.Logger.LogWarning("[ItemSync] ShipItemLight.initialHealth: " + error.Message); }
+            }
+            return e.LampFull;
+        }
+
+        /// <summary>A log burning in a stove is the stove's child with its physics switched off
+        /// (vanilla InsertFuel, <see cref="ItemComponents"/>): it has no pose of its own to apply.
+        /// The same test as <see cref="ItemComponents.InStove"/>; the entry only remembers whether
+        /// the item is a log at all, for the paths that ask every frame.</summary>
+        private static bool InStove(ItemEntry e)
+        {
+            if (!e.FuelResolved) { e.Fuel = e.Item.GetComponent<StoveFuel>(); e.FuelResolved = true; }
+            return e.Fuel != null && ItemComponents.InStove(e.Item);
         }
 
         private sealed class PendingDynamicRelease
@@ -185,6 +256,7 @@ namespace SailwindCoop.Sync
             SendLocalHeldPose(dt);
             TickInstruments(dt);
             TickOperations();
+            TickPuppetsAwaitingStart();
 
             if (_net.Role != Role.Host) return;
             ProcessPendingDynamic();
@@ -259,6 +331,7 @@ namespace SailwindCoop.Sync
                 if (e.Item == null) continue;
                 if (e.HolderNetId == _net.MyNetId) continue;   // I hold it → the game drives it locally
                 if (!e.Net.HasData) continue;
+                if (InStove(e)) continue;   // rides its stove
 
                 // Every other item (free OR held by a remote player) is a kinematic PUPPET driven purely
                 // by the host's stream. We disable the game's own ItemRigidbody so it can't fight the
@@ -274,6 +347,44 @@ namespace SailwindCoop.Sync
             }
         }
 
+        // Items that must be puppets but whose ItemRigidbody.Start has not run yet (see SetPuppet).
+        private static readonly HashSet<ShipItem> _puppetAwaitingStart = new HashSet<ShipItem>();
+        private static readonly List<ShipItem> _puppetStartScratch = new List<ShipItem>();
+
+        /// <summary>Postfix of ItemRigidbody.Start: the body exists now, finish the switch before
+        /// the game's item physics makes its first step.</summary>
+        internal static void PuppetStarted(ItemRigidbody proxy)
+        {
+            if (_puppetAwaitingStart.Count == 0 || proxy == null) return;
+            var item = proxy.GetShipItem();
+            if (item == null || !_puppetAwaitingStart.Contains(item)) return;
+            FinishPuppet(item);
+        }
+
+        private static void FinishPuppet(ShipItem item)
+        {
+            SetPuppet(item, true);
+            // One-shot callers moved the proxy while there was no body to move.
+            MoveProxyToItem(item, kinematic: true, Vector3.zero);
+        }
+
+        /// <summary>The same from Tick, for a game where the Start patch did not install.</summary>
+        private static void TickPuppetsAwaitingStart()
+        {
+            if (_puppetAwaitingStart.Count == 0) return;
+            _puppetStartScratch.Clear();
+            _puppetStartScratch.AddRange(_puppetAwaitingStart);
+            foreach (var item in _puppetStartScratch)
+            {
+                ItemRigidbody irb = null;
+                try { irb = item != null ? item.GetItemRigidbody() : null; } catch { }
+                if (irb == null) { _puppetAwaitingStart.Remove(item); continue; }
+                if (irb.GetBody() == null) continue;
+                FinishPuppet(item);
+            }
+            _puppetStartScratch.Clear();
+        }
+
         /// <summary>
         /// Turn the game's own physics for an item on/off. As a puppet (true) its ItemRigidbody is
         /// disabled, its body is kinematic, and collision detection is off. This is used for remote
@@ -285,6 +396,19 @@ namespace SailwindCoop.Sync
             try
             {
                 var irb = item != null ? item.GetItemRigidbody() : null;
+                _puppetAwaitingStart.Remove(item);
+                // ItemRigidbody.Start creates the body and the floater. Unity never runs Start on a
+                // component that was disabled first, and without the body every vanilla
+                // itemRigidbodyC.UpdateMass() throws: a pour then fills the bottle and loses the
+                // remainder it should write back to the barrel. Leave the component enabled until
+                // Start has run; PuppetStarted finishes the switch.
+                if (puppet && irb != null && irb.GetBody() == null)
+                {
+                    if (!irb.enabled) irb.enabled = true;
+                    // An inactive proxy (a log in a stove) gets its Start when it is activated.
+                    _puppetAwaitingStart.Add(item);
+                    return;
+                }
                 bool keepWallAttachDriver = puppet && item != null && item.wallAttachment && item.held != null;
                 if (irb != null && keepWallAttachDriver && !irb.enabled) irb.enabled = true;
                 else if (irb != null && !keepWallAttachDriver && irb.enabled == puppet) irb.enabled = !puppet;
@@ -564,10 +688,15 @@ namespace SailwindCoop.Sync
                 {
                     // UnsealCrate ends by opening the crate window (OpenAfterDelay) — on this machine, in
                     // front of the host's camera. The window belongs to the client that unsealed it.
-                    RemoteUnseal = true;
+                    var unsealed = crate.GetComponent<CrateInventory>();
+                    if (unsealed != null)
+                    {
+                        if (_remoteUnsealed.Count > 0 && Time.frameCount > _remoteUnsealedLast) _remoteUnsealed.Clear();
+                        _remoteUnsealedLast = Time.frameCount + RemoteUnsealFrames;
+                        _remoteUnsealed[unsealed] = _remoteUnsealedLast;
+                    }
                     try { crate.UnsealCrate(); }   // amount decrements synchronously; items insert next frame (coroutine)
                     catch (Exception ex) { Plugin.Logger.LogWarning("[ItemSync] UnsealCrate: " + ex.Message); }
-                    finally { RemoteUnseal = false; }
                     // Broadcast the crate's new amount now. The contained items are authored across the next
                     // frames (InsertItem coroutine sets currentCrateId); the periodic RefreshItems then
                     // broadcasts them as SpawnObject WITH their CrateId — so we deliberately don't force a
@@ -736,6 +865,9 @@ namespace SailwindCoop.Sync
             bool worldDrop = msg.Action == ItemAction.Drop && msg.Frame == CoordFrame.World;
             bool delayedContainerDrop = msg.Action == ItemAction.Drop && msg.CargoIndex == -2;
             bool attachedDrop = msg.Action == ItemAction.Drop && msg.Attached;
+            // An interactive State is an absolute result of the player's action and is taken whole.
+            if (msg.Action == ItemAction.Drop || (msg.Action == ItemAction.State && !msg.IsInteraction))
+                msg.Health = KeepWorldOwned(e.Item, msg.Details, msg.Health);
             ApplyWirePose(e.Item, msg.Frame, msg.BoatIndex, msg.Pos, msg.Rot, msg.Vel,
                           acceptClientScalars ? msg.Amount : FoldableState.Capture(e.Item),
                           acceptClientScalars ? msg.Health : e.Item.health,
@@ -788,9 +920,18 @@ namespace SailwindCoop.Sync
             e.HolderNetId = msg.HolderNetId;
             e.InventorySlot = msg.InventorySlot;
             // Every accepted revision is complete; no individual metadata field bypasses ordering.
-            ApplyScalarState(e.Item, msg.Amount, msg.Health, msg.Sold, msg.Nailed);
-            ItemComponents.Apply(e.Item, msg.Details);
-            if (e.Item is ShipItemLight light) LightSync.ApplyState(light, msg.LightOn, msg.Health);
+            // The one exception is an item this hand reports (SendHolderReport), for as long as the
+            // host has nothing newer than the report: the hand has gone on since, and the host's
+            // copy of it would put back what was drunk or smoked meanwhile. The values of the
+            // host's world are still taken.
+            bool ownReport = msg.RequestId != 0 && msg.Requester == _net.MyNetId && msg.RequestId == e.HolderReport && LocalHand(e.Item);
+            if (ownReport) ApplyWorldOwned(e.Item, msg.Details);
+            else
+            {
+                ApplyScalarState(e.Item, msg.Amount, msg.Health, msg.Sold, msg.Nailed);
+                ItemComponents.Apply(e.Item, msg.Details);
+                if (e.Item is ShipItemLight light) LightSync.ApplyState(light, msg.LightOn, msg.Health);
+            }
             bool locallyHeld = msg.HolderNetId == _net.MyNetId && HeldItem() == e.Item;
             if (!locallyHeld)
             {
@@ -801,7 +942,8 @@ namespace SailwindCoop.Sync
                 SetProxyAttached(e.Item, msg.Attached);
             }
             if (ItemComponents.HasPendingBinding(e.Item)) return ItemApplyStatus.Pending;
-            SetRemoteInventoryVisual(e.Item, hidden: msg.InventorySlot >= 0 && msg.HolderNetId != _net.MyNetId);
+            // The call below switches the root collider back on, which a log in a stove must not have.
+            if (!InStove(e)) SetRemoteInventoryVisual(e.Item, hidden: msg.InventorySlot >= 0 && msg.HolderNetId != _net.MyNetId);
             if (!locallyHeld && pose)
             {
                 ConfigureNetFrame(e, msg.Frame, msg.BoatIndex);
@@ -1006,6 +1148,7 @@ namespace SailwindCoop.Sync
                 if (col != null) col.enabled = !inInventory;
                 if (irb != null)
                 {
+                    _puppetAwaitingStart.Remove(item);   // a belt slot needs vanilla ItemRigidbody
                     if (!irb.enabled) irb.enabled = true;
                     irb.disableCol = false;
                     irb.ToggleCollider(!inInventory);
@@ -1046,6 +1189,7 @@ namespace SailwindCoop.Sync
 
         private static void EnterFreeDynamic(ShipItem item, CoordFrame frame, Vector3 vel, string reason)
         {
+            if (ItemComponents.InStove(item)) return;   // a delayed drop of a log that was put into a stove meanwhile
             LogItemTransition("before free " + reason, item);
             if (frame == CoordFrame.World)
                 EnsureWorldParentState(item);
@@ -1240,6 +1384,8 @@ namespace SailwindCoop.Sync
             try
             {
                 if (item == null) return;
+                // A log burning in a stove stays the stove's child without a collider or physics.
+                if (ItemComponents.InStove(item)) return;
                 item.held = null;
                 SetRemoteInventoryVisual(item, hidden: false);
                 RestoreLocalInventoryVisual(item, inInventory: false);
@@ -1511,7 +1657,10 @@ namespace SailwindCoop.Sync
                 InventorySlot = inventorySlot,
                 Attached = IsProxyAttached(e.Item),
             };
-            if (!ItemSemanticState.Equal(e.LastSemantic, state))
+            // A new revision is what makes SendExtraState send the item. Drying, spoiling, a burning
+            // log and a burning lamp move every frame, so compared exactly every such item in the
+            // world was sent twice a second for the whole session.
+            if (!ItemSemanticState.Settled(e.LastSemantic, state, LampFull(e)))
             {
                 if (++e.Revision == 0) ++e.Revision;
                 e.LastSemantic = state;
@@ -1586,6 +1735,8 @@ namespace SailwindCoop.Sync
         private void ApplyWirePose(ShipItem item, CoordFrame frame, ushort boatIndex, Vector3 pos, Quaternion rot, Vector3 vel, float amount, float health, bool sold, bool nailed, bool held)
         {
             if (item == null) return;
+            // A late pose of a log already put into a stove would take it out of the stove again.
+            if (ItemComponents.InStove(item)) { ApplyScalarState(item, amount, health, sold, nailed); return; }
             Vector3 worldPos;
             Quaternion worldRot;
             if (frame == CoordFrame.Boat)
@@ -1641,8 +1792,30 @@ namespace SailwindCoop.Sync
         // Anti-echo: set while we apply a remote crate change, so the Insert/Withdraw postfix patches
         // don't re-forward it (R13). Static because the patches are static.
         internal static bool ApplyingCrate;
-        // Set while the host runs UnsealCrate for a client: the OpenAfterDelay prefix then starts nothing.
-        internal static bool RemoteUnseal;
+        // Host: the crates it unsealed for clients, each with the last frame its window stays
+        // shut. The game opens the window one frame after the unseal (OpenAfterDelay); for these
+        // frames every opening of that crate is dropped, a later click of the host is not.
+        private static readonly Dictionary<CrateInventory, int> _remoteUnsealed = new Dictionary<CrateInventory, int>();
+        private static int _remoteUnsealedLast;
+        private const int RemoteUnsealFrames = 3;
+        internal static bool DropsCrateWindow(CrateInventory crate)
+        {
+            if (_remoteUnsealed.Count == 0 || crate == null) return false;
+            return _remoteUnsealed.TryGetValue(crate, out int last) && Time.frameCount <= last;
+        }
+
+        // A crate window keeps the items it showed and puts each of them at its button every frame.
+        // After another player took one out, the window still held it and dragged the item, now
+        // free and solid, back to the window — into the crate, which it then threw about.
+        private static void RefreshCrateWindow()
+        {
+            try
+            {
+                var ui = CrateInventoryUI.instance;
+                if (ui != null && ui.showingUI && ui.currentCrate != null) ui.RefreshButtons();
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning("[ItemSync] RefreshCrateWindow: " + ex.Message); }
+        }
 
         // Client: the crate it unsealed. Vanilla is skipped there, so its window is opened here once
         // the host's contents have arrived.
@@ -1698,6 +1871,7 @@ namespace SailwindCoop.Sync
                         else sv.currentCrateId = 0;
                     }
                     finally { ApplyingCrate = false; }
+                    RefreshCrateWindow();
                 }, error => Plugin.Logger.LogWarning("[ItemSync] ApplyCrateMembership id=" + InstanceIdOf(item) + " crate=" + crateId + ": " + error));
         }
         private CrateInventory CrateInventoryFor(int id)
@@ -2965,6 +3139,7 @@ namespace SailwindCoop.Sync
                 e.Index = (ushort)i;
                 e.InstanceId = instanceId;
                 e.PrefabIndex = prefabIndex;
+                if (e.Item != item) { e.FuelResolved = false; e.LampResolved = false; }
                 e.Item = item;
                 if (_net.Role == Role.Host && _authoredIdentity.TryGetValue(item, out var author))
                 { e.AuthorRequester = author.Key; e.AuthorRequestId = author.Value; }
@@ -3579,6 +3754,7 @@ namespace SailwindCoop.Sync
             _pendingMissionGoods.Clear();
             _nextRequest = 0;
             ClearOperations();
+            _puppetAwaitingStart.Clear();
             ItemComponents.Clear();
             _localClaimed.Clear();
             _pendingClientItems.Clear();

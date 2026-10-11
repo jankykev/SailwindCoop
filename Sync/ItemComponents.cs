@@ -201,8 +201,56 @@ namespace SailwindCoop.Sync
             fuel.inserted = state.FuelInserted; Set(fuel, "lit", state.FuelLit);
             Set(fuel, "fuelTrigger", target);
             Set(fuel, "cookTrigger", target != null ? Read<StoveCookTrigger>(target, "cookTrigger") : null);
+            PlaceFuel(item, state.FuelInserted ? target : null);
             RebuildFuelCount(old); if (target != old) RebuildFuelCount(target);
             return true;
+        }
+        internal static bool InStove(ShipItem item)
+        {
+            var parent = item != null ? item.transform.parent : null;
+            return parent != null && parent.GetComponent<ShipItemStove>() != null;
+        }
+        // The rest of vanilla StoveFuelTrigger.InsertFuel: the log leaves physics and sits inside the
+        // stove as its child. Without it the burning log stays a loose item that can be picked up, on
+        // every machine except the one where it was inserted.
+        private static void PlaceFuel(ShipItem item, StoveFuelTrigger target)
+        {
+            var proxy = item.GetItemRigidbody();
+            var collider = item.GetComponent<Collider>();
+            if (target != null)
+            {
+                Transform stove = target.transform.parent;
+                if (proxy != null && proxy.gameObject.activeSelf) proxy.gameObject.SetActive(false);
+                if (collider != null && collider.enabled) collider.enabled = false;
+                item.forceDisableRedOutline = true;
+                if (item.transform.parent == stove) return;
+                item.transform.parent = stove;
+                item.transform.localPosition = target.transform.localPosition;
+                return;
+            }
+            if (!InStove(item)) return;
+            if (proxy != null) proxy.gameObject.SetActive(true);
+            if (collider != null) collider.enabled = true;
+            item.forceDisableRedOutline = false;
+            Transform home = item.currentActualBoat != null ? item.currentActualBoat
+                : FloatingOriginManager.instance != null ? FloatingOriginManager.instance.transform : null;
+            item.transform.parent = home;
+        }
+        // The game raises a kettle's boil sound inside Cook, which a client does not run; the
+        // kettle's own Update only fades it. Same condition and rate as CookableFoodKettle.Cook
+        // for one burning log.
+        internal static void BoilSound(CookableFoodKettle cook)
+        {
+            var slot = cook.GetCurrentCookTrigger();
+            if (slot == null || slot.stove == null || cook.GetCurrentHeat() < 1f) return;
+            var kettle = Read<ShipItemKettle>(cook, "kettle");
+            if (kettle == null || kettle.currentWater <= 0f) return;
+            var fire = Read<StoveFuelTrigger>(slot.stove, "fuelTrigger");
+            if (fire == null || Read<int>(fire, "currentFuel") <= 0) return;
+            var audio = Read<AudioSource>(cook, "boilAudio");
+            if (audio == null) return;
+            if (!audio.enabled) { audio.enabled = true; audio.Play(); }
+            audio.volume += Time.deltaTime * 0.22f;
         }
         private static void RebuildFuelCount(StoveFuelTrigger trigger)
         {
@@ -210,7 +258,11 @@ namespace SailwindCoop.Sync
             int count = 0;
             foreach (var fuel in UnityEngine.Object.FindObjectsOfType<StoveFuel>())
                 if (fuel != null && fuel.inserted && Read<StoveFuelTrigger>(fuel, "fuelTrigger") == trigger) count++;
+            if (Read<int>(trigger, "currentFuel") == count) return;
             Set(trigger, "currentFuel", count);
+            // The game writes the stove's look text only from its own insertion and burn-out.
+            var stove = trigger.transform.parent != null ? trigger.transform.parent.GetComponent<ShipItemStove>() : null;
+            if (stove != null) stove.description = count == 0 ? "" : count + " / " + Read<int>(trigger, "maxFuel");
         }
         private static ShipItemStove FindStove(int id)
         {

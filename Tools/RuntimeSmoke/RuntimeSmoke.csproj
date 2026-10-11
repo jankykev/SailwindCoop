@@ -30,6 +30,8 @@
     <Compile Include="..\..\Sync\ItemAuthoring.cs" Link="ItemAuthoring.cs" />
     <Compile Include="..\..\Sync\ItemResultProgress.cs" Link="ItemResultProgress.cs" />
     <Compile Include="..\..\Sync\ItemStateGate.cs" Link="ItemStateGate.cs" />
+    <Compile Include="..\..\Sync\ItemAgeing.cs" Link="ItemAgeing.cs" />
+    <Compile Include="..\..\Net\ItemDetails.cs" Link="Net\ItemDetails.cs" />
     <Compile Include="..\..\Sync\SessionCounters.cs" Link="SessionCounters.cs" />
     <Compile Include="..\..\Sync\ChangeStream.cs" Link="ChangeStream.cs" />
     <Compile Include="..\..\Sync\ChunkAccumulator.cs" Link="ChunkAccumulator.cs" />

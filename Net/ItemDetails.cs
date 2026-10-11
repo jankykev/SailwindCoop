@@ -104,15 +104,33 @@ namespace SailwindCoop.Net
             HasClock = r.GetBool(); ClockOpen = r.GetBool(); HasQuadrant = r.GetBool(); QuadrantInspect = r.GetBool();
             HasScroll = r.GetBool(); ScrollOpen = r.GetBool(); ScrollPage = r.GetInt(); HasTotem = r.GetBool(); TotemSpent = r.GetBool();
         }
-        public bool Equals(ItemDetails other) => other != null &&
+        /// <summary>The values only the host's world moves and no drop or hand report changes:
+        /// taken from <paramref name="own"/>, the host's current state of the same item.</summary>
+        public void TakeWorldOwned(ItemDetails own)
+        {
+            if (own == null) return;
+            if (HasFood && own.HasFood) { Dried = own.Dried; Spoiled = own.Spoiled; }
+            if (HasCookable && own.HasCookable) CookHeat = own.CookHeat;
+            // A soup's spoiling is the host's too, but emptying the pot lowers it, by the game's
+            // own rule (ShipItemSoup.DrinkOrSpill): the share of the energy that left.
+            if (RecipeKind == 1 && own.RecipeKind == 1)
+            {
+                float left = own.Energy + own.UncookedEnergy - Energy - UncookedEnergy;
+                SoupSpoiled = own.SoupSpoiled * Math.Max(0f, 1f - Math.Max(0f, left));
+            }
+        }
+        public bool Equals(ItemDetails other) => Equals(other, true);
+        /// <summary><paramref name="ageing"/> false leaves out the values the world moves by itself
+        /// every frame (drying, spoiling, cooling); the sender decides about those separately.</summary>
+        public bool Equals(ItemDetails other, bool ageing) => other != null &&
             HasFood.Equals(other.HasFood) &&
-            Dried.Equals(other.Dried) &&
+            (!ageing || Dried.Equals(other.Dried)) &&
             Smoked.Equals(other.Smoked) &&
             Salted.Equals(other.Salted) &&
-            Spoiled.Equals(other.Spoiled) &&
+            (!ageing || Spoiled.Equals(other.Spoiled)) &&
             InWater.Equals(other.InWater) &&
             HasCookable.Equals(other.HasCookable) &&
-            CookHeat.Equals(other.CookHeat) &&
+            (!ageing || CookHeat.Equals(other.CookHeat)) &&
             CookStoveId.Equals(other.CookStoveId) &&
             CookSlot.Equals(other.CookSlot) &&
             RecipeKind.Equals(other.RecipeKind) &&
@@ -121,7 +139,7 @@ namespace SailwindCoop.Net
             UncookedEnergy.Equals(other.UncookedEnergy) &&
             Vitamins.Equals(other.Vitamins) &&
             Protein.Equals(other.Protein) &&
-            SoupSpoiled.Equals(other.SoupSpoiled) &&
+            (!ageing || SoupSpoiled.Equals(other.SoupSpoiled)) &&
             SoupSalted.Equals(other.SoupSalted) &&
             TeaAmount.Equals(other.TeaAmount) &&
             CookedTeaAmount.Equals(other.CookedTeaAmount) &&

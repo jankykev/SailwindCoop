@@ -11,15 +11,30 @@ namespace SailwindCoop.Sync
     internal static class ItemOperationCapture
     {
         private static Scope _active;
-        private static readonly HashSet<ShipItem> _dropped = new HashSet<ShipItem>();
+        // A drop lets the game put the item into a stove by itself, as the player's own action. The
+        // mark lasts as long as a thrown item can fly: an item that lies on the deck and is pushed
+        // into a stove later is the world's doing, not the player's.
+        private const float DropWindow = 5f;
+        private static readonly Dictionary<ShipItem, float> _dropped = new Dictionary<ShipItem, float>();
+        private static readonly List<ShipItem> _expired = new List<ShipItem>();
         internal static bool Absorb() => _active != null;
         internal static void Clear() { _active = null; _dropped.Clear(); }
         internal static void MarkDrop(ShipItem item)
         {
-            if (InteractionContext.HasInput && !InteractionContext.Suppressed && item != null &&
-                (item.GetComponent<StoveFuel>() != null || item.GetComponent<CookableFood>() != null)) _dropped.Add(item);
+            if (!InteractionContext.HasInput || InteractionContext.Suppressed || item == null ||
+                (item.GetComponent<StoveFuel>() == null && item.GetComponent<CookableFood>() == null)) return;
+            float now = Time.unscaledTime;
+            foreach (var pair in _dropped) if (pair.Key == null || now - pair.Value > DropWindow) _expired.Add(pair.Key);
+            foreach (var old in _expired) _dropped.Remove(old);
+            _expired.Clear();
+            _dropped[item] = now;
         }
-        internal static bool TakeDrop(ShipItem item) => item != null && _dropped.Remove(item);
+        internal static bool TakeDrop(ShipItem item)
+        {
+            if (item == null || !_dropped.TryGetValue(item, out float at)) return false;
+            _dropped.Remove(item);
+            return Time.unscaledTime - at <= DropWindow;
+        }
         internal static void Consumed(ShipItem item)
         {
             if (_active == null || item == null) return;
@@ -84,7 +99,10 @@ namespace SailwindCoop.Sync
                 Install(harmony, hooks, type, "OnItemClick", new[] { typeof(PickupableItem) });
             Install(harmony, hooks, typeof(ShipItemBottle), "Drink", Type.EmptyTypes);
             Install(harmony, hooks, typeof(ShipItemFood), "EatFood", Type.EmptyTypes);
-            Install(harmony, hooks, typeof(ShipItemSoup), "DrinkOrSpill", new[] { typeof(bool) });
+            hooks.Install(typeof(ShipItemSoup), "DrinkOrSpill", new[] { typeof(bool) }, m => harmony.Patch(m,
+                // A finalizer, not a postfix: the game's call ends in ItemRigidbody.UpdateMass,
+                // and a throw there must not leave the level that already changed unreported.
+                prefix: Callback(nameof(PreDrain), Priority.First), finalizer: Callback(nameof(PostDrain), Priority.Last)));
             Install(harmony, hooks, typeof(CookableFood), "InsertIntoCookTrigger", new[] { typeof(StoveCookTrigger) });
             Install(harmony, hooks, typeof(StoveFuelTrigger), "InsertFuel", new[] { typeof(ShipItem) });
             hooks.Install(typeof(ShipItem), "DestroyItem", Type.EmptyTypes, m => harmony.Patch(m, prefix: Callback(nameof(PreDestroy), Priority.First)));
@@ -110,7 +128,7 @@ namespace SailwindCoop.Sync
                 // A capture opened here would absorb the report of the bought item, and the host
                 // would never learn about it.
                 if (name == "OnAltActivate" && __instance is ShipItem bought && !bought.sold) return;
-                bool completion = name == "Drink" || name == "EatFood" || name == "DrinkOrSpill" || name == "FinishCast";
+                bool completion = name == "Drink" || name == "EatFood" || name == "FinishCast";
                 if (name == "InsertFuel" || name == "InsertIntoCookTrigger")
                 {
                     var item = __instance is CookableFood cook ? cook.GetComponent<ShipItem>() : __args[0] as ShipItem;
@@ -142,6 +160,30 @@ namespace SailwindCoop.Sync
                 var saveable = item.GetComponent<SaveablePrefab>();
                 if (saveable != null && saveable.instanceId == 0 && item.sold) saveable.RegisterToSave();
             }
+        }
+        // The game calls DrinkOrSpill every frame while a pot is tilted, on every machine that sees
+        // it tilted. One machine empties the pot (ItemSync.OwnsDrain) and the level travels as item
+        // state: an operation per frame took a snapshot of every item each time, and a watcher's
+        // copy spilled along with the holder's.
+        private static bool PreDrain(ShipItemSoup __instance, bool __0, out float __state)
+        {
+            __state = float.NaN;
+            // Called every frame for a tilted pot, also outside a session: no closure.
+            try
+            {
+                var sync = ItemSync.Instance;
+                if (sync == null || !sync.IsSessionActive) return true;
+                __state = __instance.currentWater;
+                // Not spilled but poured into this machine's own player: nobody else can feed him.
+                if (__0 && !InteractionContext.Suppressed) return sync.OwnsDrain(__instance);
+            }
+            catch (Exception error) { Report(error); }
+            return true;
+        }
+        private static void PostDrain(ShipItemSoup __instance, float __state)
+        {
+            if (float.IsNaN(__state) || __instance == null || __state.Equals(__instance.currentWater)) return;
+            PatchGuard.Run(() => ItemSync.Instance?.NotifyDrain(__instance), Report);
         }
         private static void PreDestroy(ShipItem __instance) => PatchGuard.Run(() => ItemOperationCapture.Consumed(__instance), Report);
         private static void PostRainbow() => PatchGuard.Run(ItemOperationCapture.RainbowEffect, Report);

@@ -18,6 +18,7 @@ namespace SailwindCoop.Sync
             var hooks = new SailwindCoop.Runtime.PatchHookCatalog();
             TryPatch(harmony, hooks, typeof(GoPointer), "PickUpItem", new[] { typeof(PickupableItem) }, prefixName: nameof(PrePickup), postfixName: nameof(PostPickup));
             TryPatch(harmony, hooks, typeof(GoPointer), "DropItem", Type.EmptyTypes, prefixName: nameof(PreDrop), postfixName: nameof(PostDrop));
+            TryPatch(harmony, hooks, typeof(ItemRigidbody), "Start", Type.EmptyTypes, postfixName: nameof(PostItemRigidbodyStart));
             TryPatch(harmony, hooks, typeof(ShipItemBottle), "OnItemClick", new[] { typeof(PickupableItem) },
                 prefixName: nameof(PreBottleItemClick), postfixName: nameof(PostBottleItemClick));
             TryPatch(harmony, hooks, typeof(ShipItemOar), "OnAltHeld", Type.EmptyTypes, postfixName: nameof(PostOarAltHeld));
@@ -44,7 +45,7 @@ namespace SailwindCoop.Sync
             TryPatch(harmony, hooks, typeof(CrateInventory), "InsertItem", new[] { typeof(ShipItem) }, postfixName: nameof(PostCrateInsert));
             TryPatch(harmony, hooks, typeof(CrateInventory), "WithdrawItem", new[] { typeof(ShipItem) }, postfixName: nameof(PostCrateWithdraw));
             TryPatch(harmony, hooks, typeof(ShipItemCrate), "UnsealCrate", Type.EmptyTypes, prefixName: nameof(PreUnseal));
-            TryPatch(harmony, hooks, typeof(ShipItemCrate), "OpenAfterDelay", Type.EmptyTypes, prefixName: nameof(PreOpenAfterDelay));
+            TryPatch(harmony, hooks, typeof(CrateInventoryUI), "ShowInventory", new[] { typeof(CrateInventory) }, prefixName: nameof(PreShowInventory));
             // Cargo load/unload uses each player's OWN wallet (local money) → vanilla runs locally; we only
             // mirror the resulting membership (like crates). Postfix on insert; withdraw captures the item
             // in a prefix (it isn't an argument) and forwards it in the postfix.
@@ -171,6 +172,12 @@ namespace SailwindCoop.Sync
                 return pointer.transform.forward * pointer.throwForce * f * Time.fixedDeltaTime;
             }
             catch { return Vector3.zero; }
+        }
+
+        private static void PostItemRigidbodyStart(ItemRigidbody __instance)
+        {
+            try { ItemSync.PuppetStarted(__instance); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostItemRigidbodyStart: " + e.Message); }
         }
 
         private struct BottleClickState
@@ -547,20 +554,15 @@ namespace SailwindCoop.Sync
             catch (Exception e) { WarnPatch("[ItemPatches] PreUnseal: " + e.Message); return true; }
         }
 
-        // UnsealCrate starts OpenAfterDelay, which opens the crate window on the machine it runs on. When
-        // the host unseals for a client, hand StartCoroutine an empty routine instead.
-        private static bool PreOpenAfterDelay(ref System.Collections.IEnumerator __result)
+        // UnsealCrate starts OpenAfterDelay, which opens the crate window on the machine it runs on,
+        // two frames later. When the host unseals for a client, that one opening is dropped here.
+        // Not a prefix of OpenAfterDelay or OpenCrate: both are a few instructions long, Mono
+        // inlines them into their callers and the prefix never runs.
+        private static bool PreShowInventory(CrateInventory __0)
         {
-            try
-            {
-                if (!ItemSync.RemoteUnseal) return true;
-                __result = NoRoutine();
-                return false;
-            }
-            catch (Exception e) { WarnPatch("[ItemPatches] PreOpenAfterDelay: " + e.Message); return true; }
+            try { return !ItemSync.DropsCrateWindow(__0); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PreShowInventory: " + e.Message); return true; }
         }
-
-        private static System.Collections.IEnumerator NoRoutine() { yield break; }
 
         // Cargo load/unload runs locally (own wallet); we only mirror the resulting membership.
         // After InsertItem the item's CargoPort is the carrier's port — forward it.
