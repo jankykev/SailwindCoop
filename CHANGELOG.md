@@ -2,15 +2,27 @@
 
 All notable user-facing changes are documented in this file.
 
-## [Unreleased]
+## [0.5.3] - 2026-10-11
+
+The protocol is still 92, so 0.5.3 connects to 0.5.0, 0.5.1 and 0.5.2. Update every machine
+anyway: each fix works only on the machine that has it, and with an older build in the session
+firewood in a stove and a tilted pot of soup still behave the old way for that player.
 
 ### Fixed
 
+- A guest filling a bottle, a kettle or a pot from a barrel got the water, but the barrel stayed
+  full.
+- A mug or a bowl a guest put on a table stood tilted for the other players, fell over and
+  spilled.
+- A crate could be thrown about after it was opened: its window kept dragging back the items
+  another player had already taken out.
+- Soup in a pot a guest carried did not spoil, and its freshness jumped back when the pot was
+  put down.
 - The Debug panel's island teleport could capsize the host's boat and throw it away once the
   game went on. The boat is now moved the way the game's own recovery moves it and ends up
   moored at the port.
-- A guest's copy of a boat could take hits and waves over the side of its own and sink while the
-  host's boat was whole. A guest's game no longer counts them; they come from the host.
+- A guest's copy of a boat could take hits, waves over the side and a leak of its own and sink
+  while the host's boat was whole. A guest's game no longer counts them; they come from the host.
 - Firewood put into a stove stayed a loose item for everyone but the player who put it in: it
   lay beside the stove, could be picked up while burning and did not move with the stove. It now
   sits inside the stove for every player.
