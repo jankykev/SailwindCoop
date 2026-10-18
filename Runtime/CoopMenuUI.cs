@@ -68,7 +68,7 @@ namespace SailwindCoop.Runtime
         // What the window is made of is decided once per Layout pass and kept for the Repaint that
         // follows: a control count that differs between the two passes is Unity's "Getting control
         // N's position in a group with only M controls".
-        private enum Mode { Offline, Connecting, Hosting, Joined }
+        internal enum Mode { Offline, Connecting, Hosting, Joined }
         private Mode _mode;
         private bool _settingsOpen;
         private bool _technicalSettingsOpen;
@@ -83,8 +83,13 @@ namespace SailwindCoop.Runtime
         private LanHost[] _viewLanHosts = new LanHost[0];
 
         /// <summary>The join screen of the LAN tab is on screen: only then is the network asked.</summary>
-        public bool WantsLanSearch => _visible && _mode == Mode.Offline && !_steamModeWanted && _net.Role == Role.None &&
-                                      !_coop.LeavingWorld && !ConfirmWorldJoin;
+        public bool WantsLanSearch => (_visible || PageWantsLanSearch) && _mode == Mode.Offline && !_steamModeWanted &&
+                                      _net.Role == Role.None && !_coop.LeavingWorld && !ConfirmWorldJoin;
+        /// <summary>The co-op page of the game's own menu shows the join list (<see cref="GameMenuUI"/>).</summary>
+        internal bool PageWantsLanSearch { get; set; }
+        /// <summary>The co-op page of the game's own menu is open: it shows what this window would be
+        /// opened for, so a failure or a question does not open this window over it.</summary>
+        internal System.Func<bool> PageOpen { get; set; }
         /// <summary>The port of the Port field, where a host of this crew most likely listens.</summary>
         public int SearchPort => int.TryParse(_port, out int port) ? port : 0;
         // Snapshotted: finding it is a system call, far too heavy for every IMGUI event.
@@ -152,7 +157,11 @@ namespace SailwindCoop.Runtime
         public bool Visible
         {
             get => _visible;
-            set => SetVisible(value);
+            set
+            {
+                if (value && !_visible && PageOpen != null && PageOpen()) return;
+                SetVisible(value);
+            }
         }
 
         /// <summary>The menu's own status line. Not <see cref="CoopBehaviour.Notice"/>: that one holds
@@ -984,6 +993,79 @@ namespace SailwindCoop.Runtime
             Visible = true;
         }
 
+        // -----------------------------------------------------------------
+        // The co-op page of the game's own menu (GameMenuUI): the same session, read from the same
+        // snapshot and changed by the same actions as this window.
+        // -----------------------------------------------------------------
+
+        internal void RefreshView() => Snapshot();
+        internal Mode ViewMode => _mode;
+        internal bool ViewInWorld => _viewInWorld;
+        internal bool ViewConfirmWorldJoin => _viewConfirmWorldJoin;
+        internal bool ViewLeavesHostCopy => _viewLeavesHostCopy;
+        internal bool ViewModsPrompt => _viewModsPrompt;
+        internal Sync.ModSyncView ViewMods => _modView;
+        internal bool ViewRestartPending => _restartPending;
+        internal string ViewJoinFailure => _viewJoinFailure;
+        internal string ViewSavedTarget => _viewSavedTarget;
+        internal string ViewHostAddress => _viewHostAddress;
+        internal LanHost[] ViewLanHosts => _viewLanHosts;
+        internal bool ViewSharedWallet => _sharedWallet;
+        internal bool SteamMode => _steamMode;
+        internal bool SteamReady => _steamReady;
+        internal string SteamError => _steamError;
+        internal bool SteamFriendsOnly => _steamFriendsOnly;
+        internal SteamFriendInfo[] SteamFriends => _friends;
+        /// <summary>The last line the session has for the player: an error, a notice or a status.</summary>
+        internal string ViewMessage => _viewError.Length > 0 ? _viewError : _viewNotice.Length > 0 ? _viewNotice : _viewStatus;
+        /// <summary>What the join field holds: the host's address on the LAN, its Steam ID over Steam.</summary>
+        internal string JoinField
+        {
+            get => _steamMode ? _steamJoinId : _joinIp;
+            set { if (_steamMode) _steamJoinId = value ?? ""; else _joinIp = value ?? ""; }
+        }
+
+        internal void Show() => SetVisible(true);
+        internal void JoinFromField() => Join();
+        internal void JoinLan(LanHost host) => JoinLanHost(host);
+        internal void JoinSaved() => JoinSavedTarget();
+        internal void HostWorld() => StartHost();
+        internal void UseSteam(bool steam) => SetSteamMode(steam);
+        internal void FriendsOnly(bool friendsOnly) => SetSteamFriendsOnly(friendsOnly);
+        internal void SharedWallet(bool shared) => SetSharedWallet(shared);
+
+        internal void JoinFriend(SteamFriendInfo friend)
+        {
+            _steamJoinId = friend.Id.ToString();
+            JoinSteamFromField();
+        }
+
+        internal void ToggleAccepting()
+        {
+            _net.SetAcceptingClients(!_net.AcceptingClients);
+            _status = _net.AcceptingClients ? "Session open" : "Session locked";
+        }
+
+        internal void EndSession(string status)
+        {
+            _coop.DisconnectSession("menu");
+            _status = status;
+        }
+
+        internal void CopyHostAddress()
+        {
+            if (_hostingOverSteam) { GUIUtility.systemCopyBuffer = _steamMyId.ToString(); _status = "Your Steam ID is in the clipboard"; }
+            else { GUIUtility.systemCopyBuffer = JoinPreferences.EndpointOf(_viewHostAddress); _status = "LAN address copied"; }
+        }
+
+        internal void ConfirmJoin()
+        {
+            ConfirmWorldJoin = false;
+            JoinConfirmationAccepted = true;
+        }
+
+        internal void ClearStatus() => _status = "";
+
         private void SetSteamMode(bool steam)
         {
             _steamModeWanted = steam;
@@ -1238,7 +1320,8 @@ namespace SailwindCoop.Runtime
             }
             else if (_cursorCaptured)
             {
-                bool restoreGameplayInput = GameState.playing && !GameState.currentlyLoading;
+                // Opened from the co-op page of the game's menu: that menu still holds the cursor.
+                bool restoreGameplayInput = GameState.playing && !GameState.currentlyLoading && !(PageOpen != null && PageOpen());
                 if (restoreGameplayInput)
                 {
                     MouseLook.ToggleMouseLookAndCursor(newState: true);

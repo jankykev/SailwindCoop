@@ -55,6 +55,8 @@ namespace SailwindCoop.Runtime
         private DebugPanel _debugPanel;
         private AvatarSelectUI _avatarUI;
         private CoopMenuUI _menuUI;
+        private GameMenuUI _gameMenu;
+        internal GameMenuUI GameMenu => _gameMenu;
         /// <summary>Games found on the local network, for the join screen of the F8 menu.</summary>
         public readonly LanSearch LanSearch = new LanSearch(text => Plugin.Logger.LogInfo(text));
         private const int DefaultPort = 7777;
@@ -291,6 +293,7 @@ namespace SailwindCoop.Runtime
             PatchHealth.Install("BoatActivity", () => BoatActivityPatches.Apply(_harmony), patchFault);
             PatchHealth.Install("Wind sound", () => WindSoundPatches.Apply(_harmony), patchFault);
             PatchHealth.Install("Origin catch-up", () => OriginCatchUp.Apply(_harmony), patchFault);
+            PatchHealth.Install("Game menu", () => GameMenuUI.Apply(_harmony), patchFault);
 
             PatchGuard.Run(() => {
                 var signatures = InteractionActionCatalog.Inspect(typeof(GoPointerButton).Assembly);
@@ -351,6 +354,8 @@ namespace SailwindCoop.Runtime
             _debugPanel = new DebugPanel(Net);
             _avatarUI = new AvatarSelectUI(AvatarCatalog.CurrentSelection);
             _menuUI = new CoopMenuUI(this, Net);
+            _gameMenu = new GameMenuUI(this, _menuUI);
+            _menuUI.PageOpen = () => _gameMenu.Open;
 
             BuildSteps();
             StartCoroutine(AfterPhysicsSteps());
@@ -395,6 +400,7 @@ namespace SailwindCoop.Runtime
         private float _rosterTimer;
         private CoopNotifications _notifications;
         private CoopLog.Repeat _menuFailures;
+        private CoopLog.Repeat _gameMenuFailures;
         private CoopLog.Repeat _pollFailures;
 
         /// <summary>
@@ -475,6 +481,12 @@ namespace SailwindCoop.Runtime
             catch (System.Exception e)
             {
                 Plugin.Logger.ReportError("[Coop] Menu toggle failed", e, ref _menuFailures);
+            }
+
+            try { _gameMenu?.Tick(); }
+            catch (System.Exception e)
+            {
+                Plugin.Logger.ReportError("[Coop] Game menu failed", e, ref _gameMenuFailures);
             }
 
             try { TickJoinFlow(); }

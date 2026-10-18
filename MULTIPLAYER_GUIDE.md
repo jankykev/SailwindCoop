@@ -21,6 +21,7 @@ for example `Sailwind Co-op 0.5.3 (Thunderstore)`. Sections below that apply to 
 ## Session Model
 
 - The host loads the real world save.
+- The game's own menu has the session too. On the title screen, **Co-op** (under **Settings**) opens a page with the games on this network, **Join again**, **Join by address** (click it, type the address or Steam ID, press Enter; Ctrl+V pastes) and **Network: LAN/Steam**. In a loaded world, **Co-op** in the Escape menu (right column) has **Host this world** and the same join list (a player whose session ended joins again from there); while a session runs the same page shows it and has **End session** or **Disconnect**. Questions of a join (mods, leaving a loaded world, a failed attempt) are answered on that page. **More options (F8)** opens the co-op window for the name, port and the rest.
 - Open F8 in a loaded world and press **Host a game**: the session opens at once with the remembered settings (port and Steam admission are under **Advanced settings**). At the title screen the button says that a save must be loaded first. The session card has **Copy address** / **Copy Steam ID** and **End session**.
 - On the LAN tab, **Games on this network** lists the games hosted on the same local network, each with its own **Join**; the list fills and empties by itself while the menu is open. A host that is not listed (another network, a VPN that does not pass broadcasts, a firewall, a host on 0.4.3 or older) is joined by address. A host turns the listing off with `AnnounceOnLan = false` under `[Server]`.
 - To join, the same screen has the **Join** field for a LAN address (on the Steam tab: the friends list and **Host ID**), optionally including a port (`192.168.1.4:7777` or `[::1]:7777`), then **Join** or Enter. Steam friends advertising a session have an enabled Join button; merely playing Sailwind is not a hosted session.
@@ -323,8 +324,8 @@ Before a long session, make a normal backup of important Sailwind saves.
 ## Recommended Play Flow
 
 1. Host loads the save and waits until the world is fully playable.
-2. Host opens F8 and presses `Host`.
-3. Client stays in the main menu, opens F8, enters the host IP, and presses `Join`.
+2. Host presses Escape, chooses `Co-op` and presses `Host this world` (or F8 and `Host a game`).
+3. Client stays in the main menu, chooses `Co-op` and joins the host from the list or by address (or opens F8, enters the host IP, and presses `Join`).
 4. Wait for the client to finish loading the host world.
 5. Use the status overlay if something looks wrong.
 6. Disconnect through F8 when finished.

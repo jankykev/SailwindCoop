@@ -6,6 +6,11 @@ All notable user-facing changes are documented in this file.
 
 ### Added
 
+- Co-op in the game's own menu: **Co-op** on the title screen joins a crew (games on this network,
+  Steam friends, join again, join by address), and **Co-op** in the Escape menu hosts the loaded
+  world, shows the session and ends it; in a world without a session it also lists the games to
+  join, so a player whose session ended can join again from there. The F8 window stays for the
+  other settings.
 - An item another player throws at you knocks you over: you fall, and Space gets you up. The
   others see you lying on the deck. Turn it off for yourself with `Gameplay/KnockdownByItems`.
 
