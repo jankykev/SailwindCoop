@@ -2,7 +2,11 @@
 
 All notable user-facing changes are documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-18
+
+The protocol is still 92, so 0.6.0 connects to 0.5.0 - 0.5.3. Everything new works on the machine
+that has it: the menu is your own, only a player on 0.6.0 can be knocked over, and the boat fix is
+the guest's. Update every machine anyway.
 
 ### Added
 
