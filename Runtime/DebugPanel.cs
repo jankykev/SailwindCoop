@@ -617,7 +617,7 @@ namespace SailwindCoop.Runtime
         }
 
         // -----------------------------------------------------------------
-        // Boat bodies — a client places the hull, the body is on the hull's parent
+        // Boat bodies — a client places the body (the hull's parent in game 0.39), kinematic
         // -----------------------------------------------------------------
 
         private readonly List<string> _boatLines = new List<string>();

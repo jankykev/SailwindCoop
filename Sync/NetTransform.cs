@@ -60,15 +60,30 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void Apply(Transform t, long serverTickNow)
         {
-            if (t == null || _buf.Count == 0) return;
+            if (t == null) return;
+            if (!Sample(serverTickNow, out Vector3 pos, out Quaternion rot, out _)) return;
+            t.position = pos;
+            t.rotation = rot;
+        }
+
+        /// <summary>
+        /// The pose <see cref="Apply"/> would write, for a caller that places something else from it
+        /// (a boat's body from its hull's pose). <paramref name="realVel"/> is the sampled velocity;
+        /// the origin only translates, so it is the same in local space. False until data exists.
+        /// </summary>
+        public bool Sample(long serverTickNow, out Vector3 pos, out Quaternion rot, out Vector3 realVel)
+        {
+            pos = Vector3.zero; rot = Quaternion.identity; realVel = Vector3.zero;
+            if (_buf.Count == 0) return false;
 
             long renderTick = serverTickNow - (long)InterpDelayMs;
 
             // Before the oldest sample: snap to oldest.
             if (renderTick <= _buf[0].Tick)
             {
-                Set(t, _buf[0].RealPos, _buf[0].Rot);
-                return;
+                Convert(_buf[0].RealPos, _buf[0].Rot, out pos, out rot);
+                realVel = _buf[0].RealVel;
+                return true;
             }
 
             // After the newest sample: extrapolate from it (bounded).
@@ -76,8 +91,9 @@ namespace SailwindCoop.Sync
             if (renderTick >= last.Tick)
             {
                 float ahead = Mathf.Min(renderTick - last.Tick, MaxExtrapolateMs) / 1000f;
-                Set(t, last.RealPos + last.RealVel * ahead, last.Rot);
-                return;
+                Convert(last.RealPos + last.RealVel * ahead, last.Rot, out pos, out rot);
+                realVel = last.RealVel;
+                return true;
             }
 
             // Find bracketing pair and lerp.
@@ -89,18 +105,19 @@ namespace SailwindCoop.Sync
                 {
                     float span = b.Tick - a.Tick;
                     float f = span > 0 ? (renderTick - a.Tick) / span : 0f;
-                    Vector3 real = Vector3.Lerp(a.RealPos, b.RealPos, f);
-                    Quaternion rot = Quaternion.Slerp(a.Rot, b.Rot, f);
-                    Set(t, real, rot);
-                    return;
+                    Convert(Vector3.Lerp(a.RealPos, b.RealPos, f), Quaternion.Slerp(a.Rot, b.Rot, f),
+                            out pos, out rot);
+                    realVel = Vector3.Lerp(a.RealVel, b.RealVel, f);
+                    return true;
                 }
             }
+            return false;
         }
 
-        private void Set(Transform t, Vector3 storedPos, Quaternion storedRot)
+        private void Convert(Vector3 storedPos, Quaternion storedRot, out Vector3 pos, out Quaternion rot)
         {
-            t.position = ToWorldPos != null ? ToWorldPos(storedPos) : storedPos;
-            t.rotation = ToWorldRot != null ? ToWorldRot(storedRot) : storedRot;
+            pos = ToWorldPos != null ? ToWorldPos(storedPos) : storedPos;
+            rot = ToWorldRot != null ? ToWorldRot(storedRot) : storedRot;
         }
 
         public void Clear() => _buf.Clear();

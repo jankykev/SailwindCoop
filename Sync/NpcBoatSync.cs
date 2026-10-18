@@ -430,10 +430,14 @@ namespace SailwindCoop.Sync
         {
             try
             {
-                var sync = NpcBoatSync.Instance;
-                if (sync == null || __instance == null) return true;
+                if (__instance == null) return true;
                 // BoatHorizon висит на дочернем объекте: корпус с Rigidbody — его родитель.
-                return !sync.IsSlaved(__instance.transform.parent);
+                Transform body = __instance.transform.parent;
+                var sync = NpcBoatSync.Instance;
+                if (sync != null && sync.IsSlaved(body)) return false;
+                // Лодка игроков у клиента: её тело ведёт BoatSync, кинематика — его.
+                var boats = Runtime.CoopBehaviour.Instance?.Boats;
+                return boats == null || body == null || !boats.DrivesBody(body.GetComponent<Rigidbody>());
             }
             catch (Exception e)
             {

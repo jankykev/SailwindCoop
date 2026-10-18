@@ -351,6 +351,26 @@ namespace SailwindCoop.Runtime
             _menuUI = new CoopMenuUI(this, Net);
 
             BuildSteps();
+            StartCoroutine(AfterPhysicsSteps());
+        }
+
+        private CoopLog.Repeat _afterPhysicsFailures;
+
+        /// <summary>Runs after every physics step: a client's kinematic boat bodies lose the velocity
+        /// <see cref="BoatSync"/> gave them in each step, and the game reads it until the next one.</summary>
+        private System.Collections.IEnumerator AfterPhysicsSteps()
+        {
+            var wait = new WaitForFixedUpdate();
+            while (true)
+            {
+                yield return wait;
+                try { Boats?.AfterPhysicsStep(); }
+                catch (System.Exception e)
+                {
+                    Plugin.Logger.ReportError("[Coop] Boat motion after the physics step failed", e,
+                                              ref _afterPhysicsFailures);
+                }
+            }
         }
 
         /// <summary>One isolated step of the per-frame sync pipeline. Delegates are built once in

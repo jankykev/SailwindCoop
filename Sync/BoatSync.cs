@@ -28,19 +28,24 @@ namespace SailwindCoop.Sync
             public ushort Index;
             public Transform Boat;
             public readonly NetTransform Net = new NetTransform();
+            /// <summary>The boat's body: on the hull itself or, as in game 0.39, on the hull's parent
+            /// (the object with <c>BoatProbes</c> and <c>BoatDamage</c>). This is what is placed — the
+            /// hull rides on it — so the body, its colliders and the hull never part.</summary>
             public Rigidbody Rb;
+            /// <summary>False when another boat of this index set already drives the same body (two
+            /// hulls under one root): only one owner places it and restores it.</summary>
+            public bool OwnsBody;
             public bool PrevKinematic;
             public RigidbodyInterpolation PrevInterp;
             public Component PhysSwitcher;
             public bool PrevPaused;
             public bool PrevSwitcherEnabled;
-            /// <summary>The body the hull hangs under when the hull has none of its own. Not driven:
-            /// kept only to report how far its physics carries it from the hull we place.</summary>
-            public Rigidbody RootRb;
-            public Vector3 HullLocalPos;
-            public Quaternion HullLocalRot;
-            public float LoggedDrift;
-            public float NextDriftLog;
+            /// <summary>The host's motion, re-set on the kinematic body after every physics step: the
+            /// game reads it for the wake, foam, hull sounds and apparent wind.</summary>
+            public Vector3 Velocity;
+            public Vector3 AngularVelocity;
+            public Quaternion LastBodyRot;
+            public bool HaveLastRot;
             /// <summary>False while we are only buffering: physics is still vanilla and we apply nothing.</summary>
             public bool Engaged;
         }
@@ -191,27 +196,91 @@ namespace SailwindCoop.Sync
                     continue;   // EngageSlave already applied this frame's pose
                 }
 
-                // Keep render interpolation OFF while we drive the transform directly: with
-                // RigidbodyInterpolation.Interpolate the rendered pose is blended between FIXED-step
-                // physics poses, not the one written this Update, so it oscillates against our writes
-                // with an error proportional to boat velocity — seen as the player/camera bobbing
-                // vertically in time with the swell. BoatPhysicsSwitcher re-enables Interpolate every
-                // LateUpdate (we disable that component while slaved), this is the belt-and-braces.
-                // In game 0.39 the body is on the hull's parent, so cb.Rb is null and none of this
-                // runs: see ClientBoat.RootRb.
-                if (cb.Rb != null && cb.Rb.interpolation != RigidbodyInterpolation.None)
-                    cb.Rb.interpolation = RigidbodyInterpolation.None;
-                cb.Net.Apply(cb.Boat, _net.Clock.ServerTick);
-                LogRootDrift(cb);
+                Place(cb);
             }
         }
 
-        // -----------------------------------------------------------------
-        // Client: the boat root we do not drive
-        // -----------------------------------------------------------------
+        /// <summary>
+        /// Put the boat where the host's stream says its hull is. The stream carries the HULL's pose,
+        /// but the body may sit on the hull's parent (game 0.39), so the body is placed such that the
+        /// hull lands on that pose, using the hull's current offset inside the body — the hull, its
+        /// colliders and the body stay one rigid object, on the host's place.
+        /// </summary>
+        private void Place(ClientBoat cb)
+        {
+            if (!cb.Net.Sample(_net.Clock.ServerTick, out Vector3 hullPos, out Quaternion hullRot, out Vector3 vel))
+                return;
 
-        private const float DriftLogPeriod = 30f;
-        private const float DriftLogStep = 0.5f;
+            if (cb.Rb == null)
+            {
+                cb.Boat.position = hullPos;
+                cb.Boat.rotation = hullRot;
+                return;
+            }
+            if (!TryClaimBody(cb)) return;
+
+            // Kinematic and not interpolated while we drive the transform directly. With
+            // RigidbodyInterpolation.Interpolate the rendered pose is blended between FIXED-step
+            // physics poses, not the one written this Update, so it oscillates against our writes
+            // with an error proportional to boat velocity — seen as the player/camera bobbing
+            // vertically in time with the swell. BoatPhysicsSwitcher re-enables Interpolate every
+            // LateUpdate (we disable that component while slaved) and the shipyard sets the body's
+            // kinematic flag on its own; BoatHorizon.UpdateKinematic is skipped for a driven body
+            // (NpcBoatPatches). This is the belt-and-braces for all three.
+            if (!cb.Rb.isKinematic) cb.Rb.isKinematic = true;
+            if (cb.Rb.interpolation != RigidbodyInterpolation.None)
+                cb.Rb.interpolation = RigidbodyInterpolation.None;
+
+            Transform body = cb.Rb.transform;
+            Vector3 hullOffset = Quaternion.Inverse(body.rotation) * (cb.Boat.position - body.position);
+            Quaternion hullInBody = Quaternion.Inverse(body.rotation) * cb.Boat.rotation;
+            Quaternion bodyRot = hullRot * Quaternion.Inverse(hullInBody);
+            body.SetPositionAndRotation(hullPos - bodyRot * hullOffset, bodyRot);
+
+            // RealVel is per second of the host's clock (real time); a body's velocity is per second of
+            // game time. They differ under a shared sleep's timeScale 16, which both machines run.
+            cb.Velocity = vel / Mathf.Max(Time.timeScale, 0.0001f);
+            cb.AngularVelocity = AngularVelocity(cb, bodyRot);
+            SetMotion(cb);
+        }
+
+        /// <summary>A rotation step faster than this (rad/s) is a teleport, not a turn.</summary>
+        private const float MaxAngularSpeed = 10f;
+
+        private static Vector3 AngularVelocity(ClientBoat cb, Quaternion bodyRot)
+        {
+            Vector3 w = Vector3.zero;
+            float dt = Time.deltaTime;
+            if (cb.HaveLastRot && dt > 0.0001f)
+            {
+                (bodyRot * Quaternion.Inverse(cb.LastBodyRot)).ToAngleAxis(out float degrees, out Vector3 axis);
+                if (degrees > 180f) degrees -= 360f;
+                w = axis * (degrees * Mathf.Deg2Rad / dt);
+                if (float.IsNaN(w.x) || float.IsInfinity(w.x) || w.sqrMagnitude > MaxAngularSpeed * MaxAngularSpeed)
+                    w = Vector3.zero;
+            }
+            cb.LastBodyRot = bodyRot;
+            cb.HaveLastRot = true;
+            return w;
+        }
+
+        /// <summary>A kinematic body reports zero velocity after every physics step, and a velocity set
+        /// on it moves nothing (checked in game 0.39). It is set again after each step, so every
+        /// reader in FixedUpdate, Update and LateUpdate sees the host's motion.</summary>
+        private static void SetMotion(ClientBoat cb)
+        {
+            if (cb.Rb == null || !cb.OwnsBody || !cb.Rb.isKinematic) return;
+            cb.Rb.velocity = cb.Velocity;
+            cb.Rb.angularVelocity = cb.AngularVelocity;
+        }
+
+        /// <summary>Client: called after every physics step (<c>WaitForFixedUpdate</c>).</summary>
+        public void AfterPhysicsStep()
+        {
+            if (_net.Role != Role.Client) return;
+            foreach (var cb in _clientBoats.Values)
+                if (cb.Engaged && cb.Boat != null && !ShipyardSync.Suspended(cb.Index)) SetMotion(cb);
+        }
 
         /// <summary>Hits and water over the side that <see cref="BoatDamagePatches"/> kept from a
         /// client's copy of a boat in this session.</summary>
@@ -227,28 +296,14 @@ namespace SailwindCoop.Sync
             return false;
         }
 
-        /// <summary>How far the root's own physics has carried it from where the hull is placed:
-        /// metres and degrees against the hull's pose under the root at engage.</summary>
-        private static bool RootDrift(ClientBoat cb, out float metres, out float degrees)
+        /// <summary>Client: is <paramref name="body"/> a boat body placed from the host's stream. Its
+        /// kinematic flag is ours, not <c>BoatHorizon</c>'s.</summary>
+        public bool DrivesBody(Rigidbody body)
         {
-            metres = 0f; degrees = 0f;
-            if (cb.RootRb == null || cb.Boat == null) return false;
-            Transform root = cb.RootRb.transform;
-            metres = Vector3.Distance(root.TransformPoint(cb.HullLocalPos), cb.Boat.position);
-            degrees = Quaternion.Angle(root.rotation * cb.HullLocalRot, cb.Boat.rotation);
-            return true;
-        }
-
-        private static void LogRootDrift(ClientBoat cb)
-        {
-            if (cb.RootRb == null || Time.unscaledTime < cb.NextDriftLog) return;
-            cb.NextDriftLog = Time.unscaledTime + DriftLogPeriod;
-            if (!RootDrift(cb, out float metres, out float degrees)) return;
-            if (Mathf.Abs(metres - cb.LoggedDrift) < DriftLogStep) return;
-            cb.LoggedDrift = metres;
-            Plugin.Logger.LogInfo("[BoatSync] Boat #" + cb.Index + " root is " + metres.ToString("F1") + " m, " +
-                                  degrees.ToString("F0") + " deg from its hull (kinematic=" + cb.RootRb.isKinematic +
-                                  ", speed=" + cb.RootRb.velocity.magnitude.ToString("F1") + ")");
+            if (body == null || _net.Role != Role.Client) return false;
+            foreach (var cb in _clientBoats.Values)
+                if (cb.Engaged && cb.Rb == body) return true;
+            return false;
         }
 
         /// <summary>One line per placed boat for the debug panel.</summary>
@@ -258,12 +313,12 @@ namespace SailwindCoop.Sync
             {
                 if (!cb.Engaged || cb.Boat == null) continue;
                 string line = "#" + cb.Index + " " + cb.Boat.name + ": ";
-                if (cb.Rb != null) line += "hull body driven";
-                else if (!RootDrift(cb, out float metres, out float degrees)) line += "no body";
+                if (cb.Rb == null) line += "no body, hull placed";
                 else
-                    line += "root " + (cb.RootRb.isKinematic ? "kinematic" : "dynamic") + ", interp " +
-                            cb.RootRb.interpolation + ", off hull " + metres.ToString("F2") + " m / " +
-                            degrees.ToString("F1") + " deg";
+                    line += (cb.Rb.transform == cb.Boat ? "hull" : "root '" + cb.Rb.name + "'") +
+                            (cb.OwnsBody ? "" : " (driven by another hull)") + ", " +
+                            (cb.Rb.isKinematic ? "kinematic" : "dynamic") + ", interp " + cb.Rb.interpolation +
+                            ", speed " + cb.Rb.velocity.magnitude.ToString("F1") + " m/s";
                 lines.Add(line);
             }
         }
@@ -408,30 +463,16 @@ namespace SailwindCoop.Sync
 
             Vector3 posBefore = boat.position;
 
-            cb.Rb = boat.GetComponent<Rigidbody>();
-            if (cb.Rb != null)
-            {
-                cb.PrevKinematic = cb.Rb.isKinematic;
-                cb.PrevInterp = cb.Rb.interpolation;
-                cb.Rb.isKinematic = true;
-                cb.Rb.interpolation = RigidbodyInterpolation.None;
-            }
-
-            cb.RootRb = cb.Rb == null ? boat.GetComponentInParent<Rigidbody>() : null;
-            if (cb.RootRb != null)
-            {
-                cb.HullLocalPos = cb.RootRb.transform.InverseTransformPoint(boat.position);
-                cb.HullLocalRot = Quaternion.Inverse(cb.RootRb.transform.rotation) * boat.rotation;
-                // The first measurement is always logged: "no drift" must be told from "not measured".
-                cb.LoggedDrift = float.NegativeInfinity;
-                cb.NextDriftLog = Time.unscaledTime + DriftLogPeriod;
-            }
-
-            TrySetPhysicsPaused(cb, true);
-            TrySetSwitcherEnabled(cb, slave: true);
+            // The body is on the hull or, in game 0.39, on its parent. It is the body that is placed,
+            // so it must also stop answering to this machine's physics.
+            cb.Rb = FindBody(boat);
+            cb.OwnsBody = false;
+            cb.HaveLastRot = false;
+            cb.Velocity = cb.AngularVelocity = Vector3.zero;
+            TryClaimBody(cb);
             cb.Engaged = true;
 
-            cb.Net.Apply(boat, _net.Clock.ServerTick);
+            Place(cb);
 
             if (carry)
             {
@@ -446,15 +487,51 @@ namespace SailwindCoop.Sync
             float correction = Vector3.Distance(posBefore, boat.position);
             Plugin.Logger.LogInfo("[BoatSync] Client boat #" + cb.Index + " in slave mode: correction=" +
                                   correction.ToString("F1") + " m, carriedPlayer=" + carry +
-                                  ", rb=" + (cb.Rb != null) + ", physSwitcher=" + (cb.PhysSwitcher != null));
-            if (cb.RootRb != null)
-                Plugin.Logger.LogWarning("[BoatSync] Boat #" + cb.Index + ": the body is on the hull's parent '" +
-                                         cb.RootRb.name + "' and stays under this machine's physics (kinematic=" +
-                                         cb.RootRb.isKinematic + "); only the hull is placed.");
+                                  ", body=" + (cb.Rb == null ? "none" : cb.Rb.transform == boat ? "hull" : "'" + cb.Rb.name + "'") +
+                                  (cb.Rb != null && !cb.OwnsBody ? " (driven by another hull)" : "") +
+                                  ", physSwitcher=" + (cb.PhysSwitcher != null));
             if (correction > 2000f)
                 Plugin.Logger.LogWarning("[BoatSync] Boat #" + cb.Index + " correction is " +
                                          correction.ToString("F0") + " m - the client very likely loaded a " +
                                          "different world than the host's.");
+        }
+
+        /// <summary>
+        /// The nearest <c>Rigidbody</c> on the hull or above it. Walked by hand because
+        /// <c>GetComponentInParent</c> skips inactive objects, and <c>BoatHorizonPerformanceSwitcher</c>
+        /// deactivates exactly that object — the body — on a distant boat, which is still engaged.
+        /// </summary>
+        private static Rigidbody FindBody(Transform hull)
+        {
+            for (Transform t = hull; t != null; t = t.parent)
+            {
+                var rb = t.GetComponent<Rigidbody>();
+                if (rb != null) return rb;
+            }
+            return null;
+        }
+
+        /// <summary>Take the body over unless another engaged hull already drives it. Also run from
+        /// <see cref="Place"/>, so a second hull under the same body takes over when the first is released.</summary>
+        private bool TryClaimBody(ClientBoat cb)
+        {
+            if (cb.OwnsBody) return true;
+            if (cb.Rb == null || BodyDrivenByOther(cb)) return false;
+            cb.OwnsBody = true;
+            cb.PrevKinematic = cb.Rb.isKinematic;
+            cb.PrevInterp = cb.Rb.interpolation;
+            cb.Rb.isKinematic = true;
+            cb.Rb.interpolation = RigidbodyInterpolation.None;
+            TrySetPhysicsPaused(cb, true);
+            TrySetSwitcherEnabled(cb, slave: true);
+            return true;
+        }
+
+        private bool BodyDrivenByOther(ClientBoat cb)
+        {
+            foreach (var other in _clientBoats.Values)
+                if (other != cb && other.Engaged && other.OwnsBody && other.Rb == cb.Rb) return true;
+            return false;
         }
 
         private void RestoreClientBoat(ClientBoat cb)
@@ -464,20 +541,28 @@ namespace SailwindCoop.Sync
             // Nothing was taken over if we never engaged — restoring would clobber vanilla state.
             if (cb.Engaged)
             {
-                if (cb.Rb != null)
+                if (cb.Rb != null && cb.OwnsBody)
                 {
                     cb.Rb.isKinematic = cb.PrevKinematic;
                     cb.Rb.interpolation = cb.PrevInterp;
+                    // The hull was never moved inside the body, so body and hull are still one. A body
+                    // that was dynamic when taken sails on from the host's last motion; one that was
+                    // kinematic then (BoatHorizon's call at that moment) starts from rest once
+                    // BoatHorizon frees it, as in vanilla.
+                    if (!cb.Rb.isKinematic)
+                    {
+                        cb.Rb.velocity = cb.Velocity;
+                        cb.Rb.angularVelocity = cb.AngularVelocity;
+                    }
+                    TrySetSwitcherEnabled(cb, slave: false);
+                    TrySetPhysicsPaused(cb, false, restore: true);
                 }
-
-                TrySetSwitcherEnabled(cb, slave: false);
-                TrySetPhysicsPaused(cb, false, restore: true);
                 cb.Engaged = false;
             }
 
             cb.Net.Clear();
             cb.Rb = null;
-            cb.RootRb = null;
+            cb.OwnsBody = false;
             cb.PhysSwitcher = null;
             cb.Boat = null;
         }
@@ -493,14 +578,7 @@ namespace SailwindCoop.Sync
             try
             {
                 if (cb == null || cb.Boat == null) return;
-                if (cb.PhysSwitcher == null)
-                {
-                    if (_physSwitcherType == null)
-                        _physSwitcherType = Type.GetType("BoatPhysicsSwitcher, Assembly-CSharp");
-                    if (_physSwitcherType == null) return;
-                    cb.PhysSwitcher = cb.Boat.GetComponentInChildren(_physSwitcherType);
-                }
-                var beh = cb.PhysSwitcher as Behaviour;
+                var beh = FindSwitcher(cb) as Behaviour;
                 if (beh == null) return;
 
                 if (slave)
@@ -519,18 +597,29 @@ namespace SailwindCoop.Sync
             }
         }
 
+        /// <summary>
+        /// <c>BoatPhysicsSwitcher</c> sits beside the body (game 0.39: on the hull's parent, where
+        /// <c>BoatHorizon</c> reads it), so it is looked up on the body first and under the hull only
+        /// as a fallback.
+        /// </summary>
+        private static Component FindSwitcher(ClientBoat cb)
+        {
+            if (cb.PhysSwitcher != null) return cb.PhysSwitcher;
+            if (_physSwitcherType == null)
+                _physSwitcherType = Type.GetType("BoatPhysicsSwitcher, Assembly-CSharp");
+            if (_physSwitcherType == null) return null;
+            Component found = cb.Rb != null ? cb.Rb.GetComponent(_physSwitcherType) : null;
+            if (found == null) found = cb.Boat.GetComponentInChildren(_physSwitcherType);
+            cb.PhysSwitcher = found;
+            return found;
+        }
+
         private void TrySetPhysicsPaused(ClientBoat cb, bool paused, bool restore = false)
         {
             try
             {
                 if (cb == null || cb.Boat == null) return;
-                if (_physSwitcherType == null)
-                    _physSwitcherType = Type.GetType("BoatPhysicsSwitcher, Assembly-CSharp");
-                if (_physSwitcherType == null) return;
-
-                if (cb.PhysSwitcher == null)
-                    cb.PhysSwitcher = cb.Boat.GetComponentInChildren(_physSwitcherType);
-                if (cb.PhysSwitcher == null) return;
+                if (FindSwitcher(cb) == null) return;
 
                 var field = _physSwitcherType.GetField("paused");
                 var prop = field == null ? _physSwitcherType.GetProperty("paused") : null;
