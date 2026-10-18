@@ -3,6 +3,7 @@ using System.IO;
 using System.Reflection;
 using SailwindCoop.Avatar;
 using SailwindCoop.Net;
+using SailwindCoop.Runtime;
 using UnityEngine;
 
 namespace SailwindCoop.Sync
@@ -893,23 +894,34 @@ namespace SailwindCoop.Sync
         private static bool LocalLying(Transform boat, out Vector3 head, out Vector3 feetDir)
         {
             head = feetDir = Vector3.zero;
-            Transform bed;
-            try { bed = GameState.inBed; }
-            catch { return false; }
-            if (bed == null) return false;
-
-            Transform spot = bed.childCount > 0 ? bed.GetChild(0) : bed;
-            Vector3 feet = Vector3.ProjectOnPlane(BedCentre(bed) - spot.position, Vector3.up);
-            if (feet.magnitude < 0.25f)
+            Vector3 headWorld = Vector3.zero, feet = Vector3.zero;
+            // Сбит брошенным предметом: голова и ноги — по упавшему телу (PlayerKnockdown).
+            var knockdown = CoopBehaviour.Instance?.Knockdown;
+            if (knockdown != null && knockdown.TryLying(out headWorld, out feet))
             {
-                feet = Vector3.ProjectOnPlane(spot.forward, Vector3.up);
-                // Взгляд в потолок: тогда к ногам смотрит низ камеры.
-                if (feet.magnitude < 0.5f) feet = Vector3.ProjectOnPlane(-spot.up, Vector3.up);
+                feet = Vector3.ProjectOnPlane(feet, Vector3.up);
+            }
+            else
+            {
+                Transform bed;
+                try { bed = GameState.inBed; }
+                catch { return false; }
+                if (bed == null) return false;
+
+                Transform spot = bed.childCount > 0 ? bed.GetChild(0) : bed;
+                headWorld = spot.position;
+                feet = Vector3.ProjectOnPlane(BedCentre(bed) - spot.position, Vector3.up);
+                if (feet.magnitude < 0.25f)
+                {
+                    feet = Vector3.ProjectOnPlane(spot.forward, Vector3.up);
+                    // Взгляд в потолок: тогда к ногам смотрит низ камеры.
+                    if (feet.magnitude < 0.5f) feet = Vector3.ProjectOnPlane(-spot.up, Vector3.up);
+                }
             }
             if (feet.sqrMagnitude < 1e-4f) return false;
 
             feet.Normalize();
-            head = boat != null ? boat.InverseTransformPoint(spot.position) : CoordSpace.LocalToReal(spot.position);
+            head = boat != null ? boat.InverseTransformPoint(headWorld) : CoordSpace.LocalToReal(headWorld);
             feetDir = boat != null ? Quaternion.Inverse(boat.rotation) * feet : feet;
             return true;
         }

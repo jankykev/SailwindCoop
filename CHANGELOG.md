@@ -2,6 +2,18 @@
 
 All notable user-facing changes are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- An item another player throws at you knocks you over: you fall, and Space gets you up. The
+  others see you lying on the deck. Turn it off for yourself with `Gameplay/KnockdownByItems`.
+
+### Fixed
+
+- On a guest's machine a boat's body could stay behind its hull: the wake, foam and hull sounds
+  did not follow the boat, and after a disconnect the boat was left without its physics.
+
 ## [0.5.3] - 2026-10-11
 
 The protocol is still 92, so 0.5.3 connects to 0.5.0, 0.5.1 and 0.5.2. Update every machine

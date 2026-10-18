@@ -41,6 +41,7 @@ namespace SailwindCoop.Runtime
         public MissionSync Missions { get; private set; }
         public WalletSync Wallet { get; private set; }
         public DiceSync Dice { get; private set; }
+        public PlayerKnockdown Knockdown { get; private set; }
         public ShipyardSync Shipyard { get; private set; }
         public SaveTransferSync SaveTransfer { get; private set; }
         public ModSync Mods { get; private set; }
@@ -176,6 +177,7 @@ namespace SailwindCoop.Runtime
 
             Net.PlayerGuid = CoopIdentity.Load(System.IO.Path.Combine(BepInEx.Paths.ConfigPath, "SailwindCoop")).ToString("N");
             Dice = new DiceSync(Net) { AllowStakes = Plugin.Cfg.DiceStakes.Value };
+            Knockdown = new PlayerKnockdown(Net) { Enabled = Plugin.Cfg.KnockdownByItems.Value };
 
             Boats = new BoatSync(Net)
             {
@@ -453,6 +455,8 @@ namespace SailwindCoop.Runtime
                 new SyncStep("Interactions.Tick", () => Interactions.Tick(_dt)),
                 // Before Players.Tick, so the new place goes out in this frame's pose.
                 new SyncStep("Teleport.Tick", () => Teleport.Tick()),
+                // Before Players.Tick too: a fallen player's place and the Lying flag go out in this frame.
+                new SyncStep("Knockdown.Tick", () => Knockdown.Tick()),
                 new SyncStep("Players.Tick", () => Players.Tick(_dt)),
                 new SyncStep("Players.ApplyRemotes", () => Players.ApplyRemotes()),
                 new SyncStep("Dice.Tick", () => Dice.Tick()),
@@ -1719,6 +1723,7 @@ namespace SailwindCoop.Runtime
             _inHostWorldCopy = false;
             _menuUI?.WorldLeft();
             Dice.WorldChanging();
+            Knockdown.Clear();
             // With playing cleared, the old scene's island loaders would start loading their islands
             // in this frame's LateUpdate and be destroyed before counting those loads off, leaving
             // GameState.loadingScenes above zero for good. The game's recovery (passed out, the
@@ -1787,6 +1792,7 @@ namespace SailwindCoop.Runtime
             ResetJoinStreaming();
             Net.Stop();
             Dice.Clear();
+            Knockdown.Clear();
             _notifications?.Clear();
             Shipyard.Clear();
             Missions.Clear();

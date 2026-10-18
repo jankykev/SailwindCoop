@@ -114,6 +114,7 @@ namespace SailwindCoop
         public readonly ConfigEntry<bool> DiceLitMaterials;
         public readonly ConfigEntry<bool> DiceCloseUp;
         public readonly ConfigEntry<KeyCode> DiceViewKey;
+        public readonly ConfigEntry<bool> KnockdownByItems;
         public readonly ConfigEntry<bool> GiveHintShown;
 
         public CoopConfig(ConfigFile c)
@@ -173,6 +174,7 @@ namespace SailwindCoop
             DiceLitMaterials = c.Bind("Dice", "LitMaterials", true, "The dice table uses a material of the game that reacts to light. Turn it off if the table looks wrong: it then uses a plain material that does not react to light.");
             DiceCloseUp = c.Bind("Dice", "CloseUp", true, "Sitting down at a dice table brings the table close: it fills the screen, the cursor is free and the table is played with the mouse buttons. The other players see no difference. Turn off to open the close view only with the key (UI/DiceViewKey).");
             DiceViewKey = c.Bind("UI", "DiceViewKey", KeyCode.T, "Look at a dice table and press this key for the close view of it; press it again to step back. Change it if the key is bound to something else in the game.");
+            KnockdownByItems = c.Bind("Gameplay", "KnockdownByItems", true, "An item another player throws at you knocks you over: you fall, and Space gets you up. Your own setting: it decides only whether you can be knocked over.");
             GiveHintShown = c.Bind("UI", "GiveHintShown", false, "The one-time on-screen hint about handing money over has been shown. Set to false to see it again.");
             EmoteHintShown = c.Bind("UI", "EmoteHintShown", false, "The one-time on-screen hint about the emote wheel has been shown. Set to false to see it again in the next session.");
         }

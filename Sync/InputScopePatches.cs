@@ -40,6 +40,8 @@ namespace SailwindCoop.Sync
             __state = state;
             bool consumed = false;
             PatchGuard.Run(() => consumed = CoopBehaviour.Instance?.Dice?.Input.Handle(__instance) == true, Report);
+            // A knocked-over player lets go of what it holds here, in the input scope, and points at nothing.
+            if (!consumed) PatchGuard.Run(() => consumed = CoopBehaviour.Instance?.Knockdown?.HandlePointer(__instance) == true, Report);
             return !consumed;
         }
         private static void FinishInput(InteractionContext.Scope __state)

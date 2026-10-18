@@ -222,6 +222,22 @@ namespace SailwindCoop.Sync
             Instance = this;
         }
 
+        /// <summary>The item in the local hand, or null.</summary>
+        internal ShipItem LocalHeldItem => HeldItem() as ShipItem;
+
+        /// <summary>Synced items no player holds or carries in a slot: the ones that can fly
+        /// (<see cref="PlayerKnockdown"/>).</summary>
+        internal void CollectLoose(List<ShipItem> into)
+        {
+            into.Clear();
+            foreach (var e in _items)
+            {
+                if (e.Item == null || e.HolderNetId != 0 || e.InventorySlot >= 0 || e.Item.held != null) continue;
+                if (!e.Item.gameObject.activeInHierarchy) continue;
+                into.Add(e.Item);
+            }
+        }
+
         internal void SetSaveBaseline(IEnumerable<SavePrefabData> saved)
         {
             _saveIdentity.Clear();
