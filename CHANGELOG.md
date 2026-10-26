@@ -2,6 +2,61 @@
 
 All notable user-facing changes are documented in this file.
 
+## [0.6.1] - 2026-10-26
+
+### Fixed
+
+- Ordinary client item drops no longer inherit the player's movement velocity, and the dropping
+  player briefly passes through the released item before collision resumes.
+- Client mugs stay upright during pickup and placement previews unless the player deliberately tilts
+  them with the scroll wheel.
+- Held crates and other objects show blocked-placement collision feedback; item, furniture and
+  crate world collisions are synchronized.
+- Items stored in crates now scale correctly and can be emptied by client.
+- Crates no longer show reset xyz position briefly while retaining captured pickup position.
+- Cleanable objects without an initialized dirt texture are skipped by dirt capture rather than
+  repeatedly throwing a sync error.
+- CargoController mod compatibility. Goods bought by a client stay ordinary stock instead of inheriting a mission
+  index from the product prefab, and mission indices are checked against the product before sync.
+- Sleep synchronization preserves accelerated vanilla physics while coordinating wake and sleep
+  state across both players; the reported delayed-bed-entry crash and rough-water sinking issue
+  have not recurred in the latest user test.
+- Fixed a co-op sleep crash when the client is already in bed and the host joins them later.
+- A host pause now pauses the client's simulation as well as player input, then restores the prior
+  time scale on resume without letting the settings menu restore a stale zero.
+- Host pause mirroring waits until the client is marked Ready, so the host can remain frozen during
+  save transfer without stopping the client's world-loading process.
+- `PauseHostOnJoin` and synchronized host/client pausing were confirmed working in the latest
+  two-copy join and pause/resume test.
+- Cargo Controller purchase and mission-stock handling was confirmed working in the latest test.
+
+### Changed
+
+- Remote player movement and held-item poses update more responsively, with smoother motion and
+  less visible jitter for both host and client.
+- Client Crest time follows the host boat's buffered render time, and wave phase corrections blend
+  between snapshots to reduce visible waterline mismatch.
+- Client wind values blend between host environment snapshots instead of stepping at the snapshot
+  rate, reducing abrupt inputs to sail and rigging motion.
+- Sail and yard control snapshots are sent more frequently, and client hinge smoothing follows
+  a timestamped interpolation buffer aligned with the boat's render delay; sail rope lengths
+  ease between accepted host values instead of stepping on packet arrival.
+- Host-driven client sails no longer run local sail physics that could make their rigidbodies
+  dynamic and fight the synchronized hinge pose; client apparent wind still updates for sail cloth.
+- Cargo Controller's boat and port lists now reconcile from co-op item membership and warehouse
+  area state, so remote items do not depend solely on local physics trigger callbacks.
+- Client Crest wave sets now adopt the host's random spectrum seeds and smoothly follow its wave
+  weights, so both machines build the same wavelengths and directions in rough water.
+- Boat, player, control and water rendering use the same configured snapshot buffer; wave cycle
+  values and phase/weight corrections blend between host updates without an added latency cushion.
+- Boat snapshots are sent at a steady real-time cadence with a 30 Hz minimum, independent of
+  game time scale, giving the configured interpolation buffer more samples without increasing its delay.
+- The host keeps simulating and showing ordinary client drops while the client predicts locally;
+  the client commits its settled pose back to the host after it has remained still briefly, with a
+  short blend on the client when that final correction arrives.
+- The wire protocol is version 94. Fish-catch messages include amount, health and sold state, and
+  wave snapshots include spectrum seeds and weights; both host and clients must update together.
+
 ## [0.6.0] - 2026-10-18
 
 The protocol is still 92, so 0.6.0 connects to 0.5.0 - 0.5.3. Everything new works on the machine

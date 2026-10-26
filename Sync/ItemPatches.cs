@@ -18,6 +18,12 @@ namespace SailwindCoop.Sync
             var hooks = new SailwindCoop.Runtime.PatchHookCatalog();
             TryPatch(harmony, hooks, typeof(GoPointer), "PickUpItem", new[] { typeof(PickupableItem) }, prefixName: nameof(PrePickup), postfixName: nameof(PostPickup));
             TryPatch(harmony, hooks, typeof(GoPointer), "DropItem", Type.EmptyTypes, prefixName: nameof(PreDrop), postfixName: nameof(PostDrop));
+            TryPatch(harmony, hooks, typeof(GoPointer), "LateUpdate", Type.EmptyTypes, postfixName: nameof(PostPointerLateUpdate));
+            TryPatch(harmony, hooks, typeof(PickupableItem), "OnScroll", new[] { typeof(float) }, postfixName: nameof(PostPickupableScroll));
+            TryPatch(harmony, hooks, typeof(ShipItemBottle), "ExtraLateUpdate", Type.EmptyTypes, postfixName: nameof(PostBottleExtraLateUpdate));
+            TryPatch(harmony, hooks, typeof(Mug), "Spill", Type.EmptyTypes, prefixName: nameof(PreMugSpill));
+            TryPatch(harmony, hooks, typeof(PickupableItemCollisionChecker), "OnTriggerEnter", new[] { typeof(Collider) }, postfixName: nameof(PostPlacementTrigger));
+            TryPatch(harmony, hooks, typeof(PickupableItemCollisionChecker), "OnTriggerExit", new[] { typeof(Collider) }, postfixName: nameof(PostPlacementTrigger));
             TryPatch(harmony, hooks, typeof(ItemRigidbody), "Start", Type.EmptyTypes, postfixName: nameof(PostItemRigidbodyStart));
             TryPatch(harmony, hooks, typeof(ShipItemBottle), "OnItemClick", new[] { typeof(PickupableItem) },
                 prefixName: nameof(PreBottleItemClick), postfixName: nameof(PostBottleItemClick));
@@ -100,8 +106,36 @@ namespace SailwindCoop.Sync
           catch (Exception e) { WarnPatch("[ItemPatches] PrePickup: " + e); } }
         private static void PostPickup(GoPointer __instance, PickupableItem item)
         {
-            try { ItemSync.Instance?.NotifyPickup(__instance, item); }
+            try
+            {
+                ItemSync.Instance?.PrepareMugPickup(item);
+                ItemSync.Instance?.NotifyPickup(__instance, item);
+            }
             catch (Exception e) { WarnPatch("[ItemPatches] PostPickup: " + e.Message); }
+        }
+
+        private static void PostPointerLateUpdate(GoPointer __instance)
+        {
+            try { ItemSync.Instance?.StabilizeHeldMug(__instance != null ? __instance.GetHeldItem() as ShipItemBottle : null); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostPointerLateUpdate: " + e.Message); }
+        }
+
+        private static void PostPickupableScroll(PickupableItem __instance, float __0)
+        {
+            try { ItemSync.Instance?.NoteMugScroll(__instance); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostPickupableScroll: " + e.Message); }
+        }
+
+        private static void PostBottleExtraLateUpdate(ShipItemBottle __instance)
+        {
+            try { ItemSync.Instance?.StabilizeHeldMug(__instance); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostBottleExtraLateUpdate: " + e.Message); }
+        }
+
+        private static bool PreMugSpill(Mug __instance)
+        {
+            try { return !(ItemSync.Instance?.SuppressHeldMugSpill(__instance) ?? false); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PreMugSpill: " + e.Message); return true; }
         }
 
         private sealed class DropState
@@ -138,6 +172,12 @@ namespace SailwindCoop.Sync
         {
             try { ItemSync.Instance?.NotifyDrop(__instance, __state != null ? __state.Item : null, ComputeThrowVelocity(__instance), __state != null && __state.SurfacePlaced); }
             catch (Exception e) { WarnPatch("[ItemPatches] PostDrop: " + e.Message); }
+        }
+
+        private static void PostPlacementTrigger(PickupableItemCollisionChecker __instance)
+        {
+            try { ItemSync.NormalizePlacementCollisions(__instance); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostPlacementTrigger: " + e.Message); }
         }
 
         private static bool IsSurfacePlacement(GoPointerButton target, PickupableItem held)

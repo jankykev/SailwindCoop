@@ -6,9 +6,15 @@ namespace SailwindCoop.Sync
     /// <summary>Shipping MasterPainter stroke with the originating player's color mode, without a new raycast.</summary>
     internal static class DirtPainter
     {
+        internal static bool HasTexture(CleanableObject target)
+        {
+            try { return target != null && target.GetCurrentDirtTex() != null; }
+            catch { return false; }
+        }
+
         internal static byte[] Capture(CleanableObject target)
         {
-            var source = target.GetCurrentDirtTex();
+            var source = target != null ? target.GetCurrentDirtTex() : null;
             if (source == null) throw new InvalidOperationException("CleanableObject has no dirt texture");
             if (source is Texture2D readable && readable.isReadable) return readable.EncodeToPNG();
             // Imported materials may use a GPU-only texture; loaded/saved paint is normally CPU-readable.

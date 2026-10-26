@@ -16,6 +16,48 @@ namespace SailwindCoop.Sync
     {
         public static ItemSync Instance { get; private set; }
         internal bool IsClientSession => _net.Role == Role.Client && _net.State == LinkState.Connected;
+        private static readonly HashSet<ShipItemBottle> _manualMugScroll = new HashSet<ShipItemBottle>();
+
+        internal void PrepareMugPickup(PickupableItem item)
+        {
+            if (_net.State != LinkState.Connected) return;
+            var bottle = item as ShipItemBottle;
+            if (bottle == null || bottle.GetCapacity() >= 4f) return;
+            _manualMugScroll.Remove(bottle);
+            bottle.heldRotationOffset = 0f;
+        }
+
+        internal void NoteMugScroll(PickupableItem item)
+        {
+            if (_net.State != LinkState.Connected) return;
+            var bottle = item as ShipItemBottle;
+            if (bottle == null || bottle.GetCapacity() >= 4f || bottle.held == null) return;
+            if (Mathf.Abs(Mathf.DeltaAngle(0f, bottle.heldRotationOffset)) < 0.5f)
+                _manualMugScroll.Remove(bottle);
+            else
+                _manualMugScroll.Add(bottle);
+        }
+
+        internal void StabilizeHeldMug(ShipItemBottle bottle)
+        {
+            if (_net.State != LinkState.Connected || bottle == null || bottle.GetCapacity() >= 4f || bottle.held == null) return;
+            try
+            {
+                float yaw = bottle.held.transform.eulerAngles.y;
+                bottle.transform.rotation = Quaternion.Euler(bottle.heldRotationOffset, yaw, 0f);
+            }
+            catch { }
+        }
+
+        internal bool SuppressHeldMugSpill(Mug mug)
+        {
+            if (_net.State != LinkState.Connected || mug == null) return false;
+            var bottle = mug.GetComponent<ShipItemBottle>();
+            if (bottle == null || bottle.GetCapacity() >= 4f) return false;
+            if (bottle.held != null) return !_manualMugScroll.Contains(bottle);
+            ItemEntry entry;
+            return _byItem.TryGetValue(bottle, out entry) && entry.HolderNetId != 0 && entry.HolderNetId != _net.MyNetId;
+        }
 
         private sealed class ItemEntry
         {
@@ -25,6 +67,7 @@ namespace SailwindCoop.Sync
             public uint NetId;
             public ShipItem Item;
             public readonly NetTransform Net = new NetTransform();
+            public DropCorrection DropCorrection;
             public uint HolderNetId;
             public Vector3 LastPos;
             public long LastTick;
@@ -50,6 +93,20 @@ namespace SailwindCoop.Sync
             public bool LampResolved;
             /// <summary>Client: the last report of this item from the local hand (SendHolderReport).</summary>
             public uint HolderReport;
+        }
+
+        private sealed class ClientDropLease
+        {
+            public float Elapsed;
+            public float StillFor;
+            public bool Finishing;
+        }
+
+        private sealed class DropCorrection
+        {
+            public Vector3 StartPos;
+            public Quaternion StartRot;
+            public float Elapsed;
         }
 
         /// <summary>
@@ -126,6 +183,14 @@ namespace SailwindCoop.Sync
             public string Reason;
         }
 
+        private sealed class DropPlayerCollisionIgnore
+        {
+            public Collider Player;
+            public Collider Item;
+            public float RestoreAt;
+            public bool WasIgnored;
+        }
+
         private uint _nextRequest;
         private readonly HashSet<int> _tombstones = new HashSet<int>();
         private readonly ItemMembership<ShipItem> _crateMembership = new ItemMembership<ShipItem>();
@@ -140,8 +205,14 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<ShipItem, ItemEntry> _byItem = new Dictionary<ShipItem, ItemEntry>();
         private readonly Dictionary<int, ItemEntry> _byInstanceId = new Dictionary<int, ItemEntry>();
         private readonly Dictionary<ShipItem, uint> _localHeld = new Dictionary<ShipItem, uint>();
+        // A client simulates a freshly dropped item locally until it has settled, then hands the
+        // final pose back to the host. This avoids a visible physics tug-of-war during the drop.
+        private readonly Dictionary<ShipItem, ClientDropLease> _clientDropLeases = new Dictionary<ShipItem, ClientDropLease>();
+        private readonly List<ShipItem> _dropLeaseScratch = new List<ShipItem>();
+        private readonly HashSet<ShipItem> _hostDropLeases = new HashSet<ShipItem>();
         private readonly List<ShipItem> _poseScratch = new List<ShipItem>();
         private readonly List<PendingDynamicRelease> _pendingDynamic = new List<PendingDynamicRelease>();
+        private readonly List<DropPlayerCollisionIgnore> _dropPlayerCollisionIgnores = new List<DropPlayerCollisionIgnore>();
         private readonly HashSet<ShipItem> _suppressNextDrop = new HashSet<ShipItem>();
 
         // Client: host item ids we've "claimed" into our own belt. When the host's despawn (from our claim
@@ -159,6 +230,8 @@ namespace SailwindCoop.Sync
         private static FieldInfo _fShipItemCurrentlyStayedEmbarkCol;
         private static FieldInfo _fItemRigidbodyOnBoat;
         private static FieldInfo _fColCheckerCollidedCols;
+        private static readonly Dictionary<Collider, bool> _heldProbeTriggerStates = new Dictionary<Collider, bool>();
+        private static readonly HashSet<ShipItem> _activeHeldProbes = new HashSet<ShipItem>();
         private static MethodInfo _mShipItemExitBoat;
         private float _refreshTimer;
         private float _sendTimer;
@@ -249,6 +322,7 @@ namespace SailwindCoop.Sync
 
         public void Tick(float dt)
         {
+            TickDropPlayerCollisionIgnores();
             if (_net.State != LinkState.Connected) return;
             RefreshItems(dt);
             if (_net.Role == Role.Client && _baselineReady && _pendingSpawns.Count != 0)
@@ -293,7 +367,7 @@ namespace SailwindCoop.Sync
             {
                 if (e.Item == null || !ShouldReplicate(e.Item)) continue;
                 bool hostHeld = LocalHand(e.Item);
-                bool freeMoving = e.HolderNetId == 0 && IsMoving(e.Item);
+                bool freeMoving = (e.HolderNetId == 0 || _hostDropLeases.Contains(e.Item)) && IsMoving(e.Item);
                 if (hostHeld || freeMoving)
                 {
                     _net.Broadcast(BuildState(e, tick), LiteNetLib.DeliveryMethod.Unreliable);
@@ -359,8 +433,33 @@ namespace SailwindCoop.Sync
                 PrepareForRemotePose(e.Item, held);   // layer 2 while in a hand, else 0
                 SetPuppet(e.Item, true);
                 e.Net.Apply(e.Item.transform, _net.Clock.ServerTick);
+                SmoothDropCorrection(e);
                 MoveProxyToItem(e.Item, kinematic: true, Vector3.zero);
+                // Keep the remote pose authoritative while letting the local player collide with
+                // world items. The item body stays kinematic; only its physical proxy colliders
+                // are restored. Held and container items remain visual-only.
+                if (!held && CrateIdOf(e.Item) == 0)
+                    EnableRemoteWorldCollision(e.Item);
             }
+            // ApplyRemote re-enables remote proxy colliders after toggling puppet state. Unity
+            // clears per-pair ignores on collider reactivation, so refresh the short drop-through
+            // pairs after those transitions, not only from Tick before them.
+            ReapplyDropCollisionIgnores();
+        }
+
+        private static void SmoothDropCorrection(ItemEntry e)
+        {
+            var correction = e != null ? e.DropCorrection : null;
+            if (correction == null || e.Item == null) return;
+            correction.Elapsed += Time.unscaledDeltaTime;
+            float t = Mathf.Clamp01(correction.Elapsed / 0.22f);
+            t = t * t * (3f - 2f * t);
+            Vector3 targetPos = e.Item.transform.position;
+            Quaternion targetRot = e.Item.transform.rotation;
+            e.Item.transform.SetPositionAndRotation(
+                Vector3.Lerp(correction.StartPos, targetPos, t),
+                Quaternion.Slerp(correction.StartRot, targetRot, t));
+            if (t >= 1f) e.DropCorrection = null;
         }
 
         // Items that must be puppets but whose ItemRigidbody.Start has not run yet (see SetPuppet).
@@ -459,6 +558,182 @@ namespace SailwindCoop.Sync
             catch { }
         }
 
+        private static void EnableRemoteWorldCollision(ShipItem item)
+        {
+            try
+            {
+                var irb = item != null ? item.GetItemRigidbody() : null;
+                var body = irb != null ? irb.GetBody() : null;
+                if (irb == null || body == null) return;
+                body.isKinematic = true;
+                body.detectCollisions = true;
+                irb.ToggleCollider(true);
+                foreach (var col in irb.GetComponentsInChildren<Collider>(true))
+                    if (col != null) col.enabled = true;
+            }
+            catch { }
+        }
+
+        private static void EnableHeldPlacementProbe(ShipItem item)
+        {
+            try
+            {
+                if (item == null || item.held == null || item.colChecker == null) return;
+                var irb = item.GetItemRigidbody();
+                var body = irb != null ? irb.GetBody() : null;
+                if (irb == null || body == null) return;
+
+                // Vanilla keeps the held item's colliders enabled as triggers so its collision
+                // checker can show the red placement outline. SetPuppet disables those colliders,
+                // which made client-held items appear placeable inside the boat/world.
+                body.isKinematic = true;
+                body.detectCollisions = true;
+                irb.ToggleCollider(true);
+                bool firstEnable = _activeHeldProbes.Add(item);
+                foreach (var col in irb.GetComponentsInChildren<Collider>(true))
+                {
+                    if (col == null) continue;
+                    if (!_heldProbeTriggerStates.ContainsKey(col))
+                        _heldProbeTriggerStates[col] = col.isTrigger;
+                    col.enabled = true;
+                    col.isTrigger = true;
+                }
+                if (firstEnable) ClearPlacementProbe(item.colChecker);
+            }
+            catch { }
+        }
+
+        private static void RestoreHeldPlacementProbe(ShipItem item)
+        {
+            try
+            {
+                if (item == null) return;
+                _activeHeldProbes.Remove(item);
+                foreach (var col in item.GetComponentsInChildren<Collider>(true))
+                {
+                    bool wasTrigger;
+                    if (col != null && _heldProbeTriggerStates.TryGetValue(col, out wasTrigger))
+                    {
+                        col.isTrigger = wasTrigger;
+                        _heldProbeTriggerStates.Remove(col);
+                    }
+                }
+                if (item.colChecker != null) ClearPlacementProbe(item.colChecker);
+            }
+            catch { }
+        }
+
+        private void IgnoreLocalPlayerForDroppedItem(ShipItem item)
+        {
+            try
+            {
+                var player = Refs.charController;
+                var proxy = item != null ? item.GetItemRigidbody() : null;
+                if (player == null || !player.enabled || proxy == null) return;
+                const float ignoreSeconds = 0.5f;
+                float restoreAt = Time.unscaledTime + ignoreSeconds;
+                var playerColliders = player.GetComponentsInChildren<Collider>(true);
+                var itemColliders = item.GetComponentsInChildren<Collider>(true);
+                var proxyColliders = proxy.GetComponentsInChildren<Collider>(true);
+                foreach (var playerCollider in playerColliders)
+                {
+                    if (playerCollider == null || !playerCollider.enabled || (playerCollider.isTrigger && playerCollider != player)) continue;
+                    foreach (var itemCollider in itemColliders)
+                    {
+                        IgnoreDropCollision(playerCollider, itemCollider, restoreAt);
+                    }
+                    foreach (var itemCollider in proxyColliders)
+                        IgnoreDropCollision(playerCollider, itemCollider, restoreAt);
+                }
+            }
+            catch (Exception e) { Plugin.Logger.LogWarning("[ItemSync] IgnoreLocalPlayerForDroppedItem: " + e.Message); }
+        }
+
+        private void IgnoreDropCollision(Collider player, Collider item, float restoreAt)
+        {
+            if (player == null || item == null || item.isTrigger) return;
+            DropPlayerCollisionIgnore existing = null;
+            foreach (var entry in _dropPlayerCollisionIgnores)
+                if (entry.Player == player && entry.Item == item) { existing = entry; break; }
+            if (existing != null) { existing.RestoreAt = restoreAt; return; }
+            bool wasIgnored = false;
+            try { wasIgnored = Physics.GetIgnoreCollision(player, item); } catch { }
+            try { Physics.IgnoreCollision(player, item, true); } catch { }
+            _dropPlayerCollisionIgnores.Add(new DropPlayerCollisionIgnore {
+                Player = player, Item = item, RestoreAt = restoreAt, WasIgnored = wasIgnored
+            });
+        }
+
+        private void TickDropPlayerCollisionIgnores()
+        {
+            for (int i = _dropPlayerCollisionIgnores.Count - 1; i >= 0; i--)
+            {
+                var entry = _dropPlayerCollisionIgnores[i];
+                if (Time.unscaledTime < entry.RestoreAt && entry.Player != null && entry.Item != null)
+                {
+                    try
+                    {
+                        if (!Physics.GetIgnoreCollision(entry.Player, entry.Item))
+                            Physics.IgnoreCollision(entry.Player, entry.Item, true);
+                    }
+                    catch { }
+                    continue;
+                }
+                try
+                {
+                    if (entry.Player != null && entry.Item != null)
+                        Physics.IgnoreCollision(entry.Player, entry.Item, entry.WasIgnored);
+                }
+                catch { }
+                _dropPlayerCollisionIgnores.RemoveAt(i);
+            }
+        }
+
+        private void ReapplyDropCollisionIgnores()
+        {
+            foreach (var entry in _dropPlayerCollisionIgnores)
+            {
+                if (Time.unscaledTime >= entry.RestoreAt || entry.Player == null || entry.Item == null) continue;
+                try
+                {
+                    if (!Physics.GetIgnoreCollision(entry.Player, entry.Item))
+                        Physics.IgnoreCollision(entry.Player, entry.Item, true);
+                }
+                catch { }
+            }
+        }
+
+        private static void ClearPlacementProbe(PickupableItemCollisionChecker checker)
+        {
+            if (checker == null) return;
+            checker.collisions = 0;
+            if (_fColCheckerCollidedCols == null)
+                _fColCheckerCollidedCols = typeof(PickupableItemCollisionChecker).GetField("collidedCols", BindingFlags.NonPublic | BindingFlags.Instance);
+            var list = _fColCheckerCollidedCols != null ? _fColCheckerCollidedCols.GetValue(checker) as System.Collections.IList : null;
+            list?.Clear();
+        }
+
+        internal static void NormalizePlacementCollisions(PickupableItemCollisionChecker checker)
+        {
+            try
+            {
+                if (checker == null) return;
+                if (_fColCheckerCollidedCols == null)
+                    _fColCheckerCollidedCols = typeof(PickupableItemCollisionChecker).GetField("collidedCols", BindingFlags.NonPublic | BindingFlags.Instance);
+                var list = _fColCheckerCollidedCols != null ? _fColCheckerCollidedCols.GetValue(checker) as System.Collections.IList : null;
+                if (list == null) return;
+                var item = checker.GetComponent<ShipItem>();
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    var col = list[i] as Collider;
+                    if (col == null || col.isTrigger || col.gameObject == (item != null ? item.gameObject : null))
+                        list.RemoveAt(i);
+                }
+                checker.collisions = list.Count;
+            }
+            catch { }
+        }
+
         public void NotifyPickup(GoPointer pointer, PickupableItem pickup)
         {
             if (InteractionContext.Suppressed) return;
@@ -466,6 +741,7 @@ namespace SailwindCoop.Sync
             if (_net.Role != Role.Client || _net.State != LinkState.Connected) return;
             var item = pickup as ShipItem;
             if (item == null) return;
+            _clientDropLeases.Remove(item);
             if (pointer != null) _gp = pointer;   // HeldItem() reads _gp
             RefreshItems(force: true);
             if (!_byItem.TryGetValue(item, out var e))
@@ -478,8 +754,10 @@ namespace SailwindCoop.Sync
 
             PrepareLocalPickupPose(pointer, item);
             SetPuppet(item, true);    // client-held items are visual only; no collision/boat push
+            EnableHeldPlacementProbe(item);
             e.HolderNetId = _net.MyNetId;
             e.Net.Clear();
+            e.DropCorrection = null;
             _localHeld[item] = _net.MyNetId;
             // A player-local item (just withdrawn from our belt) has no host id yet — don't send a Pickup the
             // host can't resolve. OnLocalInventory(slot<0) re-authors it; the deferred Pickup follows the remap.
@@ -530,6 +808,7 @@ namespace SailwindCoop.Sync
                 // ExitBoat clears it) and adopt the proxy's pose so the wire carries the attach point,
                 // not the stale hand pose.
                 bool placedAttach = IsProxyAttached(item);
+                RestoreHeldPlacementProbe(item);
                 if (placedAttach) MoveItemToProxy(item);
                 if (LocalPlayerBoat() == null)
                     EnsureWorldParentState(item);
@@ -543,6 +822,10 @@ namespace SailwindCoop.Sync
                 if (!placedAttach)
                     MoveProxyToItem(item, kinematic: true, Vector3.zero);
                 var msg = BuildRequest(e, ItemAction.Drop, _net.Clock.ServerTick);
+                // BuildPose estimates velocity from movement of the held transform. That motion
+                // belongs to the player; ordinary drops should start at rest. Only an explicit
+                // throw input below contributes an impulse.
+                msg.Vel = Vector3.zero;
                 msg.Attached = placedAttach;
                 if (placedAttach)
                 {
@@ -560,12 +843,31 @@ namespace SailwindCoop.Sync
                     // Send the throw velocity we computed from the pointer (world axes) in the wire frame.
                     msg.Vel = WorldToFrameAxes(msg.Frame, msg.BoatIndex, throwVelocity);
                 }
+                bool clientPhysicsLease = !placedAttach && msg.CrateId == 0;
+                if (clientPhysicsLease)
+                    msg.CargoIndex = -4; // client simulates this free drop until its body settles
                 e.DropWithoutProxyVelocity = false;
                 e.ForceWorldPoseUntilDrop = false;
                 _net.Broadcast(msg, LiteNetLib.DeliveryMethod.ReliableOrdered);
                 e.HolderNetId = _net.MyNetId;  // keep ApplyRemote off until the host sends the free state
                 e.Net.Clear();
-                SetPuppet(item, true);    // wait for the host's authoritative free pose
+                // Predict an ordinary drop locally instead of leaving the item kinematic until
+                // the host reply arrives. The reliable host state still reconciles the pose; the
+                // pending request gate prevents unrelated snapshots from undoing this prediction.
+                if (placedAttach && msg.CrateId == 0)
+                    EnterAttachedStatic(item, msg.Frame, "client predicted place #" + e.Index);
+                else if (msg.CrateId == 0)
+                {
+                    EnterFreeDynamic(item, msg.Frame, Vector3.zero, "client predicted drop #" + e.Index);
+                    IgnoreLocalPlayerForDroppedItem(item);
+                    if (clientPhysicsLease) _clientDropLeases[item] = new ClientDropLease();
+                }
+                else
+                    SetPuppet(item, true);    // attached/crated items wait for the host's semantic state
+                // A crate insert already ran vanilla InsertItem, but RestoreLocalInventoryVisual
+                // above resets its scale. Put the local copy back into the crate's inventory state
+                // after the Drop request is captured and sent.
+                if (msg.CrateId != 0) ReassertCrateInsert(item, msg.CrateId);
                 Remember("out drop #" + e.Index + " '" + item.name + "' " + PoseLabel(msg.Frame, msg.BoatIndex, msg.Pos));
             }
             else if (_net.Role == Role.Host)
@@ -585,11 +887,14 @@ namespace SailwindCoop.Sync
                 }
                 else
                 {
-                    Vector3 rbVel = RealItemVelocity(item);   // proxy body → walk-copy axes
-                    if (rbVel.sqrMagnitude > 0.0001f)
-                        state.Vel = state.Frame == CoordFrame.Boat ? ProxyToBoatAxes(item, rbVel) : rbVel;
-                    else if (throwVelocity.sqrMagnitude > 0.0001f)   // T-throw impulse hasn't hit the body yet
-                        state.Vel = WorldToFrameAxes(state.Frame, state.BoatIndex, throwVelocity);
+                    // Do not carry the player's movement into a plain drop. Preserve the game's
+                    // deliberate T-throw impulse, but reset any inherited rigidbody velocity.
+                    Vector3 worldThrow = throwVelocity.sqrMagnitude > 0.0001f ? throwVelocity : Vector3.zero;
+                    state.Vel = WorldToFrameAxes(state.Frame, state.BoatIndex, worldThrow);
+                    // Let GoPointer's one-frame throw coroutine apply an intentional throw locally;
+                    // this reset removes only inherited player/item motion before it runs.
+                    MoveProxyToItem(item, kinematic: false, Vector3.zero);
+                    IgnoreLocalPlayerForDroppedItem(item);
                 }
                 _net.Broadcast(state, LiteNetLib.DeliveryMethod.ReliableOrdered);
                 Remember("out drop(host) #" + e.Index + " '" + item.name + "'");
@@ -633,6 +938,9 @@ namespace SailwindCoop.Sync
             }
 
             bool continuous = msg.Action == ItemAction.Pose || msg.Action == ItemAction.AltHeld;
+            // Pose streams are only valid while this peer owns the item's held/drop lease.
+            // This prevents an old or stray client stream from steering a free host-owned item.
+            if (msg.Action == ItemAction.Pose && (e.HolderNetId != actor || _hostDropLeases.Contains(e.Item))) return;
             if (!e.Requests.Accept(actor, msg.RequestId, continuous)) return;
             if (!continuous && msg.RequestId != 0) { e.AckRequester = actor; e.AckRequest = msg.RequestId; }
             if (msg.Action == ItemAction.Consume)
@@ -693,6 +1001,12 @@ namespace SailwindCoop.Sync
                 if (ie != null && ie.Item != null)
                 {
                     ApplyCrateMembership(ie.Item, msg.CrateId);
+                    // Insert/withdraw completes the item's storage action. A separate Drop may
+                    // follow, but must not leave the host treating a stored item as still held.
+                    ie.HolderNetId = 0;
+                    ie.InventorySlot = -1;
+                    _localHeld.Remove(ie.Item);
+                    ie.Item.held = null;
                     _net.Broadcast(BuildState(ie, _net.Clock.ServerTick), LiteNetLib.DeliveryMethod.ReliableOrdered);
                     Remember("in crate #" + ie.Index + "->" + msg.CrateId + " actor=" + actor);
                 }
@@ -875,8 +1189,14 @@ namespace SailwindCoop.Sync
             else if (msg.Action == ItemAction.Drop)
             {
                 e.InventorySlot = -1;
-                e.HolderNetId = 0;
-                _localHeld.Remove(e.Item);
+                bool leaseStart = msg.CargoIndex == -4 && msg.CrateId == 0 && !msg.Attached;
+                e.HolderNetId = leaseStart ? actor : 0;
+                if (leaseStart) _hostDropLeases.Add(e.Item);
+                else
+                {
+                    _hostDropLeases.Remove(e.Item);
+                    _localHeld.Remove(e.Item);
+                }
                 e.Item.held = null;
             }
             else
@@ -884,17 +1204,24 @@ namespace SailwindCoop.Sync
                 if (e.HolderNetId == actor) SetPuppet(e.Item, true);                    // keep it a clean puppet while held
             }
 
-            bool acceptClientScalars = msg.Action == ItemAction.State || msg.Action == ItemAction.Drop;
+            // Crate insertion is an item operation authored by the client too. Preserve
+            // bottle liquid (amount) and fill (health), along with the other scalar state.
+            bool acceptClientScalars = msg.Action == ItemAction.State || msg.Action == ItemAction.Drop ||
+                                       msg.Action == ItemAction.Crate;
             bool worldDrop = msg.Action == ItemAction.Drop && msg.Frame == CoordFrame.World;
             bool delayedContainerDrop = msg.Action == ItemAction.Drop && msg.CargoIndex == -2;
-            bool attachedDrop = msg.Action == ItemAction.Drop && msg.Attached;
+            bool leaseStartDrop = msg.Action == ItemAction.Drop && msg.CargoIndex == -4 && msg.CrateId == 0 && !msg.Attached;
+            bool leaseReleaseDrop = msg.Action == ItemAction.Drop && msg.CargoIndex == -3 && msg.CrateId == 0 && !msg.Attached;
+            bool storedInCrate = msg.Action == ItemAction.Drop && msg.CrateId != 0;
+            bool attachedDrop = msg.Action == ItemAction.Drop && msg.Attached && !storedInCrate;
             // An interactive State is an absolute result of the player's action and is taken whole.
             if (msg.Action == ItemAction.Drop || (msg.Action == ItemAction.State && !msg.IsInteraction))
                 msg.Health = KeepWorldOwned(e.Item, msg.Details, msg.Health);
             ApplyWirePose(e.Item, msg.Frame, msg.BoatIndex, msg.Pos, msg.Rot, msg.Vel,
                           acceptClientScalars ? msg.Amount : FoldableState.Capture(e.Item),
                           acceptClientScalars ? msg.Health : e.Item.health,
-                          acceptClientScalars ? msg.Sold : e.Item.sold, acceptClientScalars ? msg.Nailed : e.Item.nailed, e.HolderNetId != 0 || worldDrop);
+                          acceptClientScalars ? msg.Sold : e.Item.sold, acceptClientScalars ? msg.Nailed : e.Item.nailed,
+                          !leaseStartDrop && (e.HolderNetId != 0 || worldDrop));
             if (acceptClientScalars)
             {
                 ItemComponents.Apply(e.Item, msg.Details);
@@ -904,10 +1231,16 @@ namespace SailwindCoop.Sync
                 EnterRemoteHeldVisual(e.Item, "host pickup #" + e.Index);
             else if (msg.Action == ItemAction.Drop)
             {
-                if (attachedDrop)
+                if (storedInCrate)
+                    ReassertCrateInsert(e.Item, msg.CrateId);
+                else if (attachedDrop)
                     EnterAttachedStatic(e.Item, msg.Frame, "host place #" + e.Index);
                 else if (delayedContainerDrop)
                     ScheduleFreeDynamic(e.Item, msg.Frame, msg.Vel, "host delayed drop #" + e.Index);
+                else if (leaseStartDrop)
+                    EnterFreeDynamic(e.Item, msg.Frame, Vector3.zero, "host sim client drop lease #" + e.Index);
+                else if (leaseReleaseDrop)
+                    EnterFreeDynamic(e.Item, msg.Frame, Vector3.zero, "host settled client drop #" + e.Index);
                 else
                     EnterFreeDynamic(e.Item, msg.Frame, msg.Vel, "host drop #" + e.Index);
             }
@@ -915,7 +1248,7 @@ namespace SailwindCoop.Sync
             // On drop, BuildState's velocity is derived from the position history and spikes because the
             // transform just teleported to the drop point — use the client's real rigidbody velocity
             // instead, or the dropped item would be flung off the ship on every receiver.
-            if (msg.Action == ItemAction.Drop) state.Vel = msg.Vel;
+            if (msg.Action == ItemAction.Drop) state.Vel = leaseStartDrop || leaseReleaseDrop ? Vector3.zero : msg.Vel;
             // A holder's resting pose arrives reliably and is relayed the same way: no later packet would repair it.
             _net.Broadcast(state, msg.Action == ItemAction.Pose && _net.ReceivingUnreliable
                 ? LiteNetLib.DeliveryMethod.Unreliable : LiteNetLib.DeliveryMethod.ReliableOrdered);
@@ -940,7 +1273,16 @@ namespace SailwindCoop.Sync
             if (!ItemComponents.BindingsReady(e.Item, msg.Details)) return ItemApplyStatus.Pending;
             return e.Gate.Apply(accepted, () => {
             uint previousHolder = e.HolderNetId;
+            bool finishClientDrop = msg.HolderNetId != _net.MyNetId &&
+                                    _clientDropLeases.TryGetValue(e.Item, out var dropLease) && dropLease.Finishing;
+            if (finishClientDrop)
+                e.DropCorrection = new DropCorrection
+                {
+                    StartPos = e.Item.transform.position,
+                    StartRot = e.Item.transform.rotation
+                };
             e.HolderNetId = msg.HolderNetId;
+            if (msg.HolderNetId != _net.MyNetId) _clientDropLeases.Remove(e.Item);
             e.InventorySlot = msg.InventorySlot;
             // Every accepted revision is complete; no individual metadata field bypasses ordering.
             // The one exception is an item this hand reports (SendHolderReport), for as long as the
@@ -960,6 +1302,7 @@ namespace SailwindCoop.Sync
             {
                 var crate = TryApplyCrateMembership(e.Item, msg.CrateId);
                 if (crate != ItemApplyStatus.Applied) return crate;
+                if (msg.CrateId != 0) ReassertCrateInsertIfNeeded(e.Item, msg.CrateId);
                 var cargo = TryApplyCargoMembership(e.Item, msg.CargoPort);
                 if (cargo != ItemApplyStatus.Applied) return cargo;
                 SetProxyAttached(e.Item, msg.Attached);
@@ -995,6 +1338,7 @@ namespace SailwindCoop.Sync
             {
                 if (e == null || e.Item == null || e.HolderNetId != actorNetId) continue;
 
+                _hostDropLeases.Remove(e.Item);
                 e.HolderNetId = 0;
                 e.InventorySlot = -1;
                 _localHeld.Remove(e.Item);
@@ -1023,6 +1367,13 @@ namespace SailwindCoop.Sync
             // LateUpdate (see NotifyDrop).
             _seenHeld = held; _seenHeldFrame = Time.frameCount;
             if (held != null) _seenHeldRot = held.transform.rotation;
+            if (held != null && !InPersonalInventory(held))
+            {
+                // ItemRigidbody is disabled while the client puppets a held item. Follow the
+                // local GoPointer pose every frame so overlap checks track the crate in-hand.
+                MoveProxyToItem(held, kinematic: true, Vector3.zero);
+                EnableHeldPlacementProbe(held);
+            }
             float interval = 1f / Mathf.Max(1f, HeldPoseHz);
             _heldPoseTimer += dt;
             if (_heldPoseTimer < interval) return;
@@ -1047,6 +1398,57 @@ namespace SailwindCoop.Sync
                     if (InPersonalInventory(it) || it.held != null) StreamLocalPose(it);
                 }
             }
+
+            StreamClientDropLeases(interval);
+        }
+
+        private void StreamClientDropLeases(float interval)
+        {
+            if (_clientDropLeases.Count == 0) return;
+            _dropLeaseScratch.Clear();
+            foreach (var pair in _clientDropLeases)
+            {
+                ShipItem item = pair.Key;
+                if (item == null || !_byItem.TryGetValue(item, out var e) ||
+                    e.HolderNetId != _net.MyNetId || !_hostIds.Contains(e.InstanceId) || item.held != null)
+                {
+                    _dropLeaseScratch.Add(item);
+                    continue;
+                }
+
+                var lease = pair.Value;
+                if (lease.Finishing) continue;
+                lease.Elapsed += interval;
+                var proxy = item.GetItemRigidbody();
+                var body = proxy != null ? proxy.GetBody() : null;
+                bool quiet = body == null ||
+                    (body.velocity.sqrMagnitude < 0.0025f && body.angularVelocity.sqrMagnitude < 0.0225f);
+                lease.StillFor = quiet ? lease.StillFor + interval : 0f;
+                bool settled = lease.StillFor >= 0.4f;
+
+                if (settled || lease.Elapsed >= 8f)
+                {
+                    var final = BuildRequest(e, ItemAction.Drop, _net.Clock.ServerTick);
+                    final.CargoIndex = -3; // host resumes physics from this settled pose
+                    final.Vel = Vector3.zero;
+                    _net.Broadcast(final, LiteNetLib.DeliveryMethod.ReliableOrdered);
+                    lease.Finishing = true;
+                    Remember("out settled drop #" + e.Index + " '" + item.name + "'");
+                    continue;
+                }
+
+                var pose = BuildRequest(e, ItemAction.Pose, _net.Clock.ServerTick);
+                bool changed = e.SentPose == null || e.SentPose.Frame != pose.Frame || pose.BoatIndex != e.SentPose.BoatIndex ||
+                    (e.SentPose.Pos - pose.Pos).sqrMagnitude > 1e-6f ||
+                    Quaternion.Angle(e.SentPose.Rot, pose.Rot) > 0.1f;
+                var mode = e.PoseStream.Next(changed);
+                if (mode == StreamSend.None) continue;
+                e.SentPose = pose;
+                _net.Broadcast(pose, mode == StreamSend.Reliable
+                    ? LiteNetLib.DeliveryMethod.ReliableOrdered : LiteNetLib.DeliveryMethod.Unreliable);
+            }
+            foreach (var item in _dropLeaseScratch) _clientDropLeases.Remove(item);
+            _dropLeaseScratch.Clear();
         }
 
         /// <summary>Send one unreliable Pose for a locally-carried item (hand or belt).</summary>
@@ -1056,7 +1458,10 @@ namespace SailwindCoop.Sync
             if (!_byItem.TryGetValue(item, out var e)) return;
             _localHeld[item] = _net.MyNetId;
             if (!InPersonalInventory(item))
-                SetPuppet(item, true);    // hand-held items stay visual/kinematic; belt slots need vanilla ItemRigidbody
+            {
+                MoveProxyToItem(item, kinematic: true, Vector3.zero);
+                EnableHeldPlacementProbe(item);
+            }
             else
                 RestoreLocalInventoryVisual(item, inInventory: true);
             if (!_hostIds.Contains(e.InstanceId)) return;
@@ -1414,6 +1819,7 @@ namespace SailwindCoop.Sync
             try
             {
                 if (item == null) return;
+                RestoreHeldPlacementProbe(item);
                 // A log burning in a stove stays the stove's child without a collider or physics.
                 if (ItemComponents.InStove(item)) return;
                 item.held = null;
@@ -1553,6 +1959,17 @@ namespace SailwindCoop.Sync
                 if (pointer == null || item == null) return;
                 RestoreLocalInventoryVisual(item, inInventory: false);
 
+                // GoPointer captured a large item's picked-up offset before this postfix ran.
+                // Keep that pose; moving the crate to the generic hand point here makes it jump
+                // there briefly before LateUpdate restores the captured offset.
+                if (item.big)
+                {
+                    if (LocalPlayerBoat() == null)
+                        EnsureWorldParentState(item);
+                    MoveProxyToItem(item, kinematic: true, Vector3.zero);
+                    return;
+                }
+
                 Transform p = pointer.transform;
                 if (p != null)
                 {
@@ -1625,8 +2042,11 @@ namespace SailwindCoop.Sync
                 Health = e.Item.health,
                 Sold = e.Item.sold,
                 Nailed = e.Item.nailed,
-                CrateId = CrateIdOf(e.Item),
-                CargoPort = CargoPortOf(e.Item),
+                // Vanilla crate/cargo withdrawal can call PickUpItem before or after clearing
+                // membership depending on the UI path. A Pickup is itself proof that this item
+                // is leaving storage, so never let a stale membership reinsert it on the host.
+                CrateId = action == ItemAction.Pickup ? 0 : CrateIdOf(e.Item),
+                CargoPort = action == ItemAction.Pickup ? -1 : CargoPortOf(e.Item),
                 InventorySlot = PersonalInventorySlotOf(e.Item),
                 Attached = IsProxyAttached(e.Item),
             };
@@ -1803,6 +2223,10 @@ namespace SailwindCoop.Sync
             item.health = health;
             item.sold = sold;
             item.nailed = nailed;
+            if (item is ShipItemBottle bottle && bottle.itemRigidbodyC != null)
+            {
+                try { bottle.itemRigidbodyC.UpdateMass(); } catch { }
+            }
             // У удочки health = наличие крючка; ваниль обновляет hookVisuals только из своих методов
             // (OnItemClick/DetachHook/OnLoad), поэтому после сетевого health зовём UpdateHook сами —
             // иначе удочка «выглядит без крючка», хотя health уже 1 (и наоборот).
@@ -1878,6 +2302,30 @@ namespace SailwindCoop.Sync
         /// done under the anti-echo guard so the relay patches don't bounce it back.
         /// </summary>
         private void ApplyCrateMembership(ShipItem item, int crateId) => TryApplyCrateMembership(item, crateId);
+        // A client may send Crate then Drop for one UI insertion. Drop pose application resets
+        // localScale to one and its attached path treats the inventory flag like a wall placement.
+        // Re-run vanilla InsertItem after that pose so scale, layer and rigidbody flags stay correct.
+        private void ReassertCrateInsert(ShipItem item, int crateId)
+        {
+            var target = CrateInventoryFor(crateId);
+            if (item == null || target == null) return;
+            ApplyingCrate = true;
+            try { target.InsertItem(item); }
+            finally { ApplyingCrate = false; }
+        }
+        private void ReassertCrateInsertIfNeeded(ShipItem item, int crateId)
+        {
+            var target = CrateInventoryFor(crateId);
+            var saveable = item != null ? item.GetComponent<SaveablePrefab>() : null;
+            var irb = item != null ? item.GetItemRigidbody() : null;
+            if (target == null || saveable == null || irb == null) return;
+            Vector3 expectedScale = Vector3.one * (item.inventoryScale * 0.33f);
+            bool scaleMismatch = (item.transform.localScale - expectedScale).sqrMagnitude > 0.0001f;
+            bool physicsMismatch = !irb.attached || !irb.disableCol || !irb.inStove;
+            bool membershipMismatch = saveable.currentCrateId != crateId || !target.containedItems.Contains(item);
+            if (scaleMismatch || physicsMismatch || membershipMismatch || item.gameObject.layer != 26)
+                ReassertCrateInsert(item, crateId);
+        }
         private ItemApplyStatus TryApplyCrateMembership(ShipItem item, int crateId)
         {
             if (item == null) return ItemApplyStatus.Pending;
@@ -1885,7 +2333,7 @@ namespace SailwindCoop.Sync
             var target = CrateInventoryFor(crateId);
             return _crateMembership.Apply(item,
                 () => sv != null && sv.currentCrateId == crateId && CrateListsMatch(item, target) && (crateId == 0 ||
-                    (target != null && target.containedItems.Contains(item))),
+                    (target != null && target.containedItems.Contains(item) && CrateVisualMatches(item))),
                 () => sv != null && item.itemRigidbodyC != null && (crateId == 0 || target != null),
                 () => {
                     ApplyingCrate = true;
@@ -1903,6 +2351,14 @@ namespace SailwindCoop.Sync
                     finally { ApplyingCrate = false; }
                     RefreshCrateWindow();
                 }, error => Plugin.Logger.LogWarning("[ItemSync] ApplyCrateMembership id=" + InstanceIdOf(item) + " crate=" + crateId + ": " + error));
+        }
+        private static bool CrateVisualMatches(ShipItem item)
+        {
+            if (item == null) return false;
+            var irb = item.GetItemRigidbody();
+            if (irb == null || !irb.attached || !irb.disableCol || !irb.inStove || item.gameObject.layer != 26) return false;
+            Vector3 expectedScale = Vector3.one * (item.inventoryScale * 0.33f);
+            return (item.transform.localScale - expectedScale).sqrMagnitude <= 0.0001f;
         }
         private CrateInventory CrateInventoryFor(int id)
         {
@@ -3433,10 +3889,23 @@ namespace SailwindCoop.Sync
             return s != null ? s.instanceId : 0;
         }
 
-        private static int MissionIndexOf(ShipItem item)
+        internal static int MissionIndexOf(ShipItem item)
         {
             var good = item != null ? item.GetComponent<Good>() : null;
-            return good != null ? good.GetMissionIndex() : -1;
+            if (good == null) return -1;
+            int index = good.GetMissionIndex();
+            if (index < 0) return -1;
+            var missions = PlayerMissions.missions;
+            if (missions == null || index >= missions.Length || missions[index] == null) return index;
+            var expected = missions[index].goodPrefab != null
+                ? missions[index].goodPrefab.GetComponent<SaveablePrefab>() : null;
+            var actual = item.GetComponent<SaveablePrefab>();
+            if (expected == null || actual == null || expected.prefabIndex == actual.prefabIndex) return index;
+
+            // A newly bought Good clone inherits the prefab's serialized mission slot (usually 0).
+            // If that slot names another product, it is ordinary stock, not mission cargo.
+            good.RegisterAsMissionless();
+            return -1;
         }
 
         /// <summary>Client: give a good the mission slot the host's copy has. A Good prefab carries slot 0,
@@ -3457,6 +3926,15 @@ namespace SailwindCoop.Sync
                     // the slot, so the good stays plain until the mission is there (same as a vanilla load).
                     good.RegisterAsMissionless();
                     _pendingMissionGoods[instanceId] = missionIndex;
+                    return;
+                }
+                var expected = mission.goodPrefab != null ? mission.goodPrefab.GetComponent<SaveablePrefab>() : null;
+                var actual = item.GetComponent<SaveablePrefab>();
+                if (expected != null && actual != null && expected.prefabIndex != actual.prefabIndex)
+                {
+                    bool changed = good.GetMissionIndex() != -1;
+                    good.RegisterAsMissionless();
+                    if (changed) item.UpdateLookText();
                     return;
                 }
                 if (good.GetMissionIndex() == missionIndex) return;
@@ -3662,6 +4140,9 @@ namespace SailwindCoop.Sync
                 BoatIndex = boatIndex,
                 Pos = pos,
                 Rot = rot,
+                Amount = FoldableState.Capture(item),
+                Health = item.health,
+                Sold = item.sold,
             }, LiteNetLib.DeliveryMethod.ReliableOrdered);
             Remember("out client-authored prefab=" + PrefabIndexOf(item) + " '" + item.name + "'");
         }
@@ -3725,9 +4206,13 @@ namespace SailwindCoop.Sync
                 var item = go.GetComponent<ShipItem>();
                 var saveable = go.GetComponent<SaveablePrefab>();
                 if (item == null || saveable == null) { UnityEngine.Object.Destroy(go); return; }
+                // Bought goods arrive through this host-authoring path. A Good component copied
+                // from a prefab can carry missionIndex 0 even though the client bought stock.
+                var authoredGood = go.GetComponent<Good>();
+                if (authoredGood != null) authoredGood.RegisterAsMissionless();
                 _authoringItem = item;
                 _authoredIdentity[item] = new KeyValuePair<uint, uint>(actor, msg.RequestId);
-                item.sold = true;
+                ApplyScalarState(item, msg.Amount, msg.Health, msg.Sold, item.nailed);
                 saveable.prefabIndex = msg.PrefabIndex;
                 saveable.RegisterToSave();   // assigns a fresh nonzero host id
                 RefreshItems(force: true);
@@ -3761,6 +4246,17 @@ namespace SailwindCoop.Sync
 
         public void Clear()
         {
+            _manualMugScroll.Clear();
+            _clientDropLeases.Clear();
+            _dropLeaseScratch.Clear();
+            _hostDropLeases.Clear();
+            for (int i = _dropPlayerCollisionIgnores.Count - 1; i >= 0; i--)
+            {
+                var ignored = _dropPlayerCollisionIgnores[i];
+                try { if (ignored.Player != null && ignored.Item != null) Physics.IgnoreCollision(ignored.Player, ignored.Item, ignored.WasIgnored); }
+                catch { }
+            }
+            _dropPlayerCollisionIgnores.Clear();
             foreach (var e in _items)
                 if (e != null && e.Item != null)
                     RestoreDisconnectedItem(e.Item);

@@ -1664,6 +1664,9 @@ namespace SailwindCoop.Net
         public ushort BoatIndex;
         public Vector3 Pos;
         public Quaternion Rot;
+        public float Amount;
+        public float Health;
+        public bool Sold;
 
         public MsgType Type => MsgType.FishCatch;
 
@@ -1675,6 +1678,9 @@ namespace SailwindCoop.Net
             w.Put(BoatIndex);
             w.PutVector3(Pos);
             w.PutQuaternion(Rot);
+            w.Put(Amount);
+            w.Put(Health);
+            w.Put(Sold);
         }
 
         public void Deserialize(NetDataReader r)
@@ -1685,6 +1691,9 @@ namespace SailwindCoop.Net
             BoatIndex = r.GetUShort();
             Pos = r.GetVector3();
             Rot = r.GetQuaternion();
+            Amount = r.GetFloat();
+            Health = r.GetFloat();
+            Sold = r.GetBool();
         }
     }
 
@@ -2655,11 +2664,18 @@ namespace SailwindCoop.Net
     {
         /// <summary>One array per Gerstner set, in the order the sender enumerated them.</summary>
         public float[][] Sets = new float[0][];
+        /// <summary>Wave seeds and weights in the same set order; different seeds change every wavelength and direction.</summary>
+        public int[] Seeds = new int[0];
+        public float[] Weights = new float[0];
 
         public MsgType Type => MsgType.WavePhases;
 
         public void Serialize(LiteNetLib.Utils.NetDataWriter w)
         {
+            w.Put((byte)Seeds.Length);
+            for (int i = 0; i < Seeds.Length; i++) w.Put(Seeds[i]);
+            w.Put((byte)Weights.Length);
+            for (int i = 0; i < Weights.Length; i++) w.Put(Weights[i]);
             w.Put((byte)Sets.Length);
             for (int s = 0; s < Sets.Length; s++)
             {
@@ -2671,6 +2687,12 @@ namespace SailwindCoop.Net
 
         public void Deserialize(LiteNetLib.Utils.NetDataReader r)
         {
+            int seedCount = r.GetByte();
+            Seeds = new int[seedCount];
+            for (int i = 0; i < seedCount; i++) Seeds[i] = r.GetInt();
+            int weightCount = r.GetByte();
+            Weights = new float[weightCount];
+            for (int i = 0; i < weightCount; i++) Weights[i] = r.GetFloat();
             int n = r.GetByte();
             Sets = new float[n][];
             for (int s = 0; s < n; s++)

@@ -22,7 +22,7 @@ namespace SailwindCoop.Sync
     /// </list>
     ///
     /// Both lists are enumerated identically on host and client (same boat → same order);
-    /// rotations are slerped each frame for smoothness between the ~12 Hz snapshots.
+    /// rotations are smoothed per rendered frame between the 30 Hz snapshots.
     /// Stage 2 (shared control) will instead route client adjustments as ownership requests.
     /// </summary>
     public sealed partial class ControlsSync
@@ -32,6 +32,12 @@ namespace SailwindCoop.Sync
         {
             public Transform T;     // the moving transform whose local rotation we sync
             public Rigidbody Rb;    // its rigidbody (null = visual-only, e.g. a winch crank)
+        }
+
+        private sealed class RotationSnapshot
+        {
+            public long Tick;
+            public Quaternion[] Rotations;
         }
 
         private readonly Transform _boundBoat;
@@ -66,8 +72,11 @@ namespace SailwindCoop.Sync
 
         // Client: latest rotation targets + which rigidbodies we forced kinematic.
         private Quaternion[] _targetRots = System.Array.Empty<Quaternion>();
+        private Quaternion[] _sampledRots = System.Array.Empty<Quaternion>();
         private bool _haveTargets;
+        private readonly List<RotationSnapshot> _rotationSamples = new List<RotationSnapshot>();
         private readonly List<KeyValuePair<Rigidbody, bool>> _kinematicSaved = new List<KeyValuePair<Rigidbody, bool>>();
+        private readonly List<KeyValuePair<Rigidbody, RigidbodyInterpolation>> _interpolationSaved = new List<KeyValuePair<Rigidbody, RigidbodyInterpolation>>();
 
         // Per-rope capture and acknowledged input; held/pending protection has no timeout.
         private float[] _hostLen = System.Array.Empty<float>();
@@ -90,9 +99,11 @@ namespace SailwindCoop.Sync
         private FieldInfo _fClicked;
 
         /// <summary>Control snapshot rate (Hz). The wheel/booms can move quickly, so keep it brisk.</summary>
-        public float ControlHz = 12f;
-        /// <summary>How fast the client slerps a node toward its latest target rotation.</summary>
-        public float RotSmoothing = 14f;
+        public float ControlHz = 30f;
+        /// <summary>Render controls this far behind the host clock, matching the boat pose buffer.</summary>
+        public float InterpDelayMs = 100f;
+        /// <summary>How quickly client rope lengths follow accepted host values.</summary>
+        public float RopeSmoothing = 18f;
 
         public int RopeCount { get { if (_fleet == null) return _ropes.Length; int n = 0; foreach (var c in _fleet.Values) n += c.RopeCount; return n; } }
         public int NodeCount { get { if (_fleet == null) return _nodes.Length; int n = 0; foreach (var c in _fleet.Values) n += c.NodeCount; return n; } }
@@ -132,8 +143,40 @@ namespace SailwindCoop.Sync
             _net = net;
             Instance = this;
 
-            _fleet = new BoatContexts<ControlsSync>((boat, id) => new ControlsSync(net, boat, id), c => c.Clear(),
+            _fleet = new BoatContexts<ControlsSync>((boat, id) =>
+                {
+                    var c = new ControlsSync(net, boat, id);
+                    c.InterpDelayMs = InterpDelayMs;
+                    return c;
+                }, c => c.Clear(),
                 boat => BoatLayout.Stamp(boat.GetComponentsInChildren<RopeController>(true), boat.GetComponentsInChildren<HingeJoint>(true), boat.GetComponentsInChildren<GPButtonSteeringWheel>(true)));
+        }
+
+        /// <summary>True when this sail's hinge pose is host-authoritative on the client. Sail.FixedUpdate
+        /// otherwise turns its Rigidbody dynamic again and applies local wind forces, fighting the
+        /// synchronized hinge pose every physics step.</summary>
+        internal static bool IsHostDrivenSail(Sail sail)
+        {
+            var owner = Instance;
+            if (owner == null || sail == null || owner._net.Role != Role.Client ||
+                owner._net.State != LinkState.Connected) return false;
+            if (owner._fleet != null)
+            {
+                foreach (var context in owner._fleet.Values)
+                    if (context.OwnsSailPose(sail)) return true;
+                return false;
+            }
+            return owner.OwnsSailPose(sail);
+        }
+
+        private bool OwnsSailPose(Sail sail)
+        {
+            if (sail == null || !_haveTargets || _boundBoat == null || !sail.transform.IsChildOf(_boundBoat)) return false;
+            Rigidbody rb = sail.GetComponent<Rigidbody>();
+            if (rb == null) return false;
+            for (int i = 0; i < _nodes.Length; i++)
+                if (_nodes[i].Rb == rb) return true;
+            return false;
         }
 
         private ControlsSync(CoopNet net, Transform boat, ushort id)
@@ -271,11 +314,6 @@ namespace SailwindCoop.Sync
                         if (rc == null) continue;
                         if (_ropeDirty[i] || !_ropeTracks[i].Receive(msg.RopeEpochs[i], msg.Tick, _net.MyNetId)) continue;
                         _hostLen[i] = msg.Lengths[i];
-                        if (!IsLocalRopeHeld(rc, held) && !rc.currentLength.Equals(msg.Lengths[i]))
-                        {
-                            rc.currentLength = msg.Lengths[i];
-                            rc.changed = true;   // let the controller's Update re-apply
-                        }
                     }
                 }
             }
@@ -292,15 +330,13 @@ namespace SailwindCoop.Sync
                     EnsureKinematic();
                     _targetRots = msg.Rotations;
                     _haveTargets = true;
+                    AddRotationSample(msg.Tick, msg.Rotations);
                 }
             }
         }
 
-        /// <summary>
-        /// Client per-frame: (1) forward any rope the local player just adjusted to the
-        /// host as a request (Stage 2), and (2) smoothly drive each node toward its latest
-        /// target rotation.
-        /// </summary>
+        /// <summary>Client per-frame: forward local adjustments, then render buffered hinge poses
+        /// and smoothly follow accepted rope lengths.</summary>
         public void ApplyClient(float dt)
         {
             if (_fleet != null) { foreach (var c in _fleet.Values) c.ApplyClient(dt); return; }
@@ -314,19 +350,73 @@ namespace SailwindCoop.Sync
             // angle comes back through the node-rotation sync below, which turns the client's wheel.
             GoPointerButton heldBtn = HeldButton();
             ForwardSteering(dt, heldBtn);
+            ApplyBufferedControls(dt, heldBtn);
+        }
 
-            if (!_haveTargets || _nodes.Length == 0) return;
-            if (_targetRots.Length != _nodes.Length) return;
+        private void AddRotationSample(long tick, Quaternion[] rotations)
+        {
+            if (_rotationSamples.Count > 0 && tick < _rotationSamples[_rotationSamples.Count - 1].Tick) return;
+            var copy = (Quaternion[])rotations.Clone();
+            if (_rotationSamples.Count > 0 && tick == _rotationSamples[_rotationSamples.Count - 1].Tick)
+                _rotationSamples[_rotationSamples.Count - 1] = new RotationSnapshot { Tick = tick, Rotations = copy };
+            else
+                _rotationSamples.Add(new RotationSnapshot { Tick = tick, Rotations = copy });
+            while (_rotationSamples.Count > 12) _rotationSamples.RemoveAt(0);
+        }
 
-            // Slerp every moving hinge (booms + rudder) toward the host's value — including the
-            // rudder of a wheel the local player is holding, so they see the real steering result.
-            float t = 1f - Mathf.Exp(-RotSmoothing * dt);
-            for (int i = 0; i < _nodes.Length; i++)
+        private void ApplyBufferedControls(float dt, GoPointerButton held)
+        {
+            if (_haveTargets && _nodes.Length > 0 && _targetRots.Length == _nodes.Length && _rotationSamples.Count > 0)
             {
-                var tr = _nodes[i].T;
-                if (tr == null) continue;
-                tr.localRotation = Quaternion.Slerp(tr.localRotation, _targetRots[i], t);
+                if (_sampledRots.Length != _nodes.Length) _sampledRots = new Quaternion[_nodes.Length];
+                long renderTick = _net.Clock.ServerTick - (long)InterpDelayMs;
+                if (SampleRotations(renderTick, _sampledRots))
+                    for (int i = 0; i < _nodes.Length; i++)
+                    {
+                        var tr = _nodes[i].T;
+                        if (tr != null) tr.localRotation = _sampledRots[i];
+                    }
             }
+
+            float t = 1f - Mathf.Exp(-RopeSmoothing * dt);
+            for (int i = 0; i < _ropes.Length && i < _hostLen.Length; i++)
+            {
+                var rope = _ropes[i];
+                if (rope == null || _ropeDirty[i] || _ropeTracks[i].Gate.Pending || IsLocalRopeHeld(rope, held)) continue;
+                float next = Mathf.Lerp(rope.currentLength, _hostLen[i], t);
+                if (Mathf.Abs(next - rope.currentLength) > 0.0001f)
+                {
+                    rope.currentLength = next;
+                    rope.changed = true;
+                }
+            }
+        }
+
+        private bool SampleRotations(long renderTick, Quaternion[] result)
+        {
+            if (_rotationSamples.Count == 0) return false;
+            var first = _rotationSamples[0];
+            if (renderTick <= first.Tick)
+            {
+                System.Array.Copy(first.Rotations, result, result.Length);
+                return true;
+            }
+            for (int s = 0; s < _rotationSamples.Count - 1; s++)
+            {
+                var a = _rotationSamples[s];
+                var b = _rotationSamples[s + 1];
+                if (renderTick > b.Tick) continue;
+                float f = b.Tick > a.Tick ? (renderTick - a.Tick) / (float)(b.Tick - a.Tick) : 1f;
+                for (int i = 0; i < result.Length; i++)
+                    result[i] = Quaternion.Slerp(a.Rotations[i], b.Rotations[i], f);
+                while (_rotationSamples.Count > 2 && _rotationSamples[1].Tick < renderTick)
+                    _rotationSamples.RemoveAt(0);
+                return true;
+            }
+            while (_rotationSamples.Count > 2 && _rotationSamples[1].Tick < renderTick)
+                _rotationSamples.RemoveAt(0);
+            System.Array.Copy(_rotationSamples[_rotationSamples.Count - 1].Rotations, result, result.Length);
+            return true;
         }
 
         /// <summary>
@@ -519,6 +609,7 @@ namespace SailwindCoop.Sync
             RestoreKinematic();   // release the previous boat's bodies before rebinding
             _cachedBoat = boat;
             _haveTargets = false;
+            _rotationSamples.Clear();
             _warnedMismatch.Clear();
             _gp = null;
             _fSticky = null;
@@ -587,7 +678,9 @@ namespace SailwindCoop.Sync
             {
                 if (n.Rb == null) continue;
                 _kinematicSaved.Add(new KeyValuePair<Rigidbody, bool>(n.Rb, n.Rb.isKinematic));
+                _interpolationSaved.Add(new KeyValuePair<Rigidbody, RigidbodyInterpolation>(n.Rb, n.Rb.interpolation));
                 n.Rb.isKinematic = true;
+                n.Rb.interpolation = RigidbodyInterpolation.None;
             }
         }
 
@@ -596,6 +689,9 @@ namespace SailwindCoop.Sync
             foreach (var kv in _kinematicSaved)
                 if (kv.Key != null) kv.Key.isKinematic = kv.Value;
             _kinematicSaved.Clear();
+            foreach (var kv in _interpolationSaved)
+                if (kv.Key != null) kv.Key.interpolation = kv.Value;
+            _interpolationSaved.Clear();
         }
 
         private void WarnMismatch(string what, int host, int client)
@@ -652,6 +748,8 @@ namespace SailwindCoop.Sync
             _rudderOld = null;
             _nodes = System.Array.Empty<Node>();
             _targetRots = System.Array.Empty<Quaternion>();
+            _sampledRots = System.Array.Empty<Quaternion>();
+            _rotationSamples.Clear();
             _hostLen = System.Array.Empty<float>();
             _lastSentLen = System.Array.Empty<float>();
             ResetControlTracks();

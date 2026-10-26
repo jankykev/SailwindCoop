@@ -72,7 +72,20 @@ namespace SailwindCoop.Sync
         // Physics-rate hook for every sail: no closure per call.
         private static bool PreSail(Sail __instance)
         {
-            try { return !ShipyardSync.PauseSail(__instance); }
+            try
+            {
+                if (ControlsSync.IsHostDrivenSail(__instance))
+                {
+                    // Keep the client copy's sail cloth responsive to the host wind, but never
+                    // let Sail.FixedUpdate re-enable its rigidbody or apply a competing local force.
+                    if (__instance.shipRigidbody != null)
+                        __instance.apparentWind = global::Wind.currentWind - __instance.shipRigidbody.velocity;
+                    Rigidbody sailBody = __instance.GetComponent<Rigidbody>();
+                    if (sailBody != null && !sailBody.isKinematic) sailBody.isKinematic = true;
+                    return false;
+                }
+                return !ShipyardSync.PauseSail(__instance);
+            }
             catch (Exception error) { try { Report(error); } catch { } return true; }
         }
     }

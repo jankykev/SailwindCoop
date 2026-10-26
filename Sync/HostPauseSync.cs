@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using SailwindCoop.Net;
 using SailwindCoop.Runtime;
 using UnityEngine;
@@ -6,44 +7,42 @@ using UnityEngine;
 namespace SailwindCoop.Sync
 {
     /// <summary>
-    /// Пауза хоста должна останавливать и клиента.
+    /// Mirrors a host gameplay pause on the ready client. The host also pauses during save transfer,
+    /// but the client must keep running until its streamed world has finished loading.
     ///
-    /// Хост останавливает мир штатно — игровым меню (<c>MainMenu.GameToSettings</c> ставит
-    /// <c>Time.timeScale = 0</c>) и на время передачи сохранения новому игроку
-    /// (<see cref="JoinPause"/>). Всё, чем распоряжается хост, при этом замирает само:
-    /// <see cref="BoatSync"/>, <see cref="ItemSync"/> и <see cref="AnchorSync"/> не шлют снапшотов при
-    /// нулевом <c>timeScale</c>, а часы воды стоят, потому что их шаг умножается на хостовый масштаб
-    /// (<see cref="CrestWaterSync"/>). Не замирал ровно один объект — сам клиент: он продолжал ходить
-    /// по палубе остановленного мира, мог сойти с лодки или упасть в воду, а его взаимодействия
-    /// уезжали хосту, который ответит на них через неизвестно сколько.
+    /// During a gameplay pause, freezing the client's simulation prevents loose items and local
+    /// physics from advancing beyond the authoritative host world. The game's settings menu stores
+    /// its previous time scale in <c>unpausedTimescale</c>; that value is repaired when necessary so
+    /// closing a menu opened during the network pause cannot leave the client frozen at zero.
     ///
-    /// Поэтому на время паузы хоста клиенту отключается управление персонажем — тот же приём, что у
-    /// ведомого сна (<see cref="SleepSync"/>): <c>Refs.SetPlayerControl(false)</c> гасит
-    /// <c>OVRPlayerController</c> и <c>CharacterController</c>. Осмотреться мышью можно, уйти — нет.
-    ///
-    /// Свой <c>Time.timeScale</c> клиент сознательно НЕ трогает. Игровое меню Sailwind запоминает
-    /// «доспаузный» масштаб в собственное поле (<c>unpausedTimescale</c>) при открытии и возвращает
-    /// его при закрытии; открывшись во время нашей паузы, оно запомнило бы ноль и вернуло бы ноль —
-    /// клиент остался бы замороженным насовсем, уже без нашего участия.
-    ///
-    /// Управление возвращается, как только хост снял паузу ИЛИ пропала связь: остаться замороженным
-    /// из-за последнего дошедшего снапшота «хост на паузе» — это софтлок, а не верность хосту.
+    /// The client resumes when the host unpauses or the connection ends. A stale pause state must
+    /// never leave the client permanently frozen.
     /// </summary>
     public sealed class HostPauseSync
     {
+        private static readonly FieldInfo UnpausedTimescaleField =
+            typeof(StartMenu).GetField("unpausedTimescale", BindingFlags.NonPublic | BindingFlags.Instance);
+
         private readonly CoopNet _net;
         private bool _frozen;
+        private bool _ownsTimeScale;
+        private float _resumeTimeScale = 1f;
         private CoopLog.Repeat _controlReport;
 
         public HostPauseSync(CoopNet net) { _net = net; }
 
-        /// <summary>Держим ли мы сейчас клиента замороженным. Читают баннер на экране и оверлей.</summary>
+        /// <summary>Whether the client is currently frozen by the host's pause.</summary>
         public bool Frozen => _frozen;
 
         public void Tick(EnvironmentSync env)
         {
+            // JoinPause deliberately stops the host while the client receives and loads the save.
+            // Freezing the client in that window can suspend Unity's load/finalization work and crash.
+            // Only mirror ordinary gameplay pauses after this client has reported Ready.
+            var coop = CoopBehaviour.Instance;
             bool want = _net.Role == Role.Client &&
                         _net.State == LinkState.Connected &&
+                        coop != null && coop.ClientJoined &&
                         env != null && env.HasHostState &&
                         env.HostTimeScale <= 0.0001f;
             SetFrozen(want);
@@ -59,13 +58,35 @@ namespace SailwindCoop.Sync
             {
                 if (value)
                 {
+                    // Stop the client's world simulation as well as its player controller. Otherwise
+                    // loose items and local physics continue while the host's authoritative world is
+                    // frozen. Preserve an already-open game's menu restore value if it paused first.
+                    float savedMenuScale = ReadMenuTimescale();
+                    _resumeTimeScale = Time.timeScale > 0.0001f ? Time.timeScale :
+                        (savedMenuScale > 0.0001f ? savedMenuScale : 1f);
+                    _ownsTimeScale = Time.timeScale > 0.0001f;
+                    if (_ownsTimeScale) Time.timeScale = 0f;
                     Refs.SetPlayerControl(false);
                 }
-                else if ((SleepSync.Instance == null || !SleepSync.Instance.ClientAsleep) && GameState.inBed == null)
+                else
                 {
-                    // Ведомый сон держит управление по своей причине — не возвращать его за него,
-                    // иначе спящий клиент вдруг пойдёт гулять с чёрным экраном.
-                    Refs.SetPlayerControl(true);
+                    if (IsGameMenuOpen())
+                    {
+                        // The vanilla menu restores the value it captured on opening. Replace a
+                        // captured zero with the pre-host-pause scale so closing it cannot softlock.
+                        WriteMenuTimescale(_resumeTimeScale);
+                    }
+                    else if ((_ownsTimeScale || Time.timeScale <= 0.0001f) && Time.timeScale <= 0.0001f)
+                    {
+                        Time.timeScale = _resumeTimeScale > 0.0001f ? _resumeTimeScale : 1f;
+                    }
+                    _ownsTimeScale = false;
+
+                    if (!IsGameMenuOpen() && (SleepSync.Instance == null || !SleepSync.Instance.ClientAsleep) && GameState.inBed == null)
+                    {
+                        // SleepSync owns player control while the client is asleep; leave it disabled.
+                        Refs.SetPlayerControl(true);
+                    }
                 }
             }
             catch (Exception e)
@@ -74,6 +95,34 @@ namespace SailwindCoop.Sync
                                           e.Message, ref _controlReport);
             }
             Plugin.Logger.LogInfo("[HostPauseSync] client " + (value ? "frozen (host paused)" : "released"));
+        }
+
+        private static bool IsGameMenuOpen()
+        {
+            try { return GameState.inCursorMenu; }
+            catch { return false; }
+        }
+
+        private static float ReadMenuTimescale()
+        {
+            try
+            {
+                var menu = UnityEngine.Object.FindObjectOfType<StartMenu>();
+                return menu != null && UnpausedTimescaleField != null
+                    ? (float)UnpausedTimescaleField.GetValue(menu) : 0f;
+            }
+            catch { return 0f; }
+        }
+
+        private static void WriteMenuTimescale(float value)
+        {
+            try
+            {
+                var menu = UnityEngine.Object.FindObjectOfType<StartMenu>();
+                if (menu != null && UnpausedTimescaleField != null)
+                    UnpausedTimescaleField.SetValue(menu, value > 0.0001f ? value : 1f);
+            }
+            catch { /* Menu recovery is best-effort; never interrupt network pause release. */ }
         }
     }
 }

@@ -26,6 +26,14 @@ namespace SailwindCoop.Sync
         private bool _windDisabled;     // client: did we turn off the local Wind sim?
         private bool _wavesDisabled;    // client: did we turn off the local WavesInertia sim?
         private WavesInertia _waves;    // cached; no singleton on the engine type
+        private Vector3 _targetWind;
+        private Vector3 _targetBaseWind;
+        private Quaternion _targetWindRotation = Quaternion.identity;
+        private bool _haveWindTarget;
+
+        /// <summary>Client wind snapshots arrive at 4 Hz. Smooth their visual/physics input between
+        /// packets so sails, yards and rope components do not react to a stepped wind value.</summary>
+        private const float WindFollowRate = 8f;
 
         /// <summary>Часы и форма воды живут в <see cref="CrestWaterSync"/> — это состояние среды,
         /// поэтому едет оно в этом же снапшоте, но вся логика там.</summary>
@@ -48,7 +56,12 @@ namespace SailwindCoop.Sync
 
         public void Tick(float dt)
         {
-            if (_net.Role == Role.Client) { if (Crest != null) Crest.Tick(); return; }
+            if (_net.Role == Role.Client)
+            {
+                if (Crest != null) Crest.Tick();
+                SmoothClientWind(dt);
+                return;
+            }
             if (_net.Role != Role.Host) return;
             if (_net.State != LinkState.Connected) return;
 
@@ -112,16 +125,25 @@ namespace SailwindCoop.Sync
         {
             if (_net.Role != Role.Client) return;
 
-            // Wind: take over from the local simulation so it stops fighting us.
+            // Wind: take over from the local simulation so it stops fighting us. Keep each
+            // snapshot as a target and blend toward it in Tick; writing a new wind every 250 ms
+            // makes client sail and rigging physics respond in visible steps.
             var wind = global::Wind.instance;
             if (wind != null && wind.enabled)
             {
                 wind.enabled = false;
                 _windDisabled = true;
             }
-            global::Wind.currentWind = msg.Wind;
-            global::Wind.currentBaseWind = msg.BaseWind;
-            global::Wind.windRotation = msg.WindRot;
+            if (!_haveWindTarget)
+            {
+                global::Wind.currentWind = msg.Wind;
+                global::Wind.currentBaseWind = msg.BaseWind;
+                global::Wind.windRotation = msg.WindRot;
+                _haveWindTarget = true;
+            }
+            _targetWind = msg.Wind;
+            _targetBaseWind = msg.BaseWind;
+            _targetWindRotation = msg.WindRot;
 
             // Time / sun: re-anchor; the client sun keeps advancing between snapshots.
             var sun = Sun.sun;
@@ -176,6 +198,10 @@ namespace SailwindCoop.Sync
             }
             _waves = null;
             _sendStamp = float.NegativeInfinity;
+            _haveWindTarget = false;
+            _targetWind = Vector3.zero;
+            _targetBaseWind = Vector3.zero;
+            _targetWindRotation = Quaternion.identity;
 
             // Снимок хоста больше не действителен. Без сброса сессия, оборвавшаяся на паузе хоста,
             // оставила бы HostTimeScale = 0 навсегда: следующий клиент был бы заморожен
@@ -184,6 +210,15 @@ namespace SailwindCoop.Sync
             HasHostState = false;
             HostTimeScale = 1f;
 
+        }
+
+        private void SmoothClientWind(float dt)
+        {
+            if (!_haveWindTarget || dt <= 0f) return;
+            float blend = 1f - Mathf.Exp(-WindFollowRate * dt);
+            global::Wind.currentWind = Vector3.Lerp(global::Wind.currentWind, _targetWind, blend);
+            global::Wind.currentBaseWind = Vector3.Lerp(global::Wind.currentBaseWind, _targetBaseWind, blend);
+            global::Wind.windRotation = Quaternion.Slerp(global::Wind.windRotation, _targetWindRotation, blend);
         }
     }
 

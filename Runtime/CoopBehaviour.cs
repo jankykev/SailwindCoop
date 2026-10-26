@@ -29,6 +29,7 @@ namespace SailwindCoop.Runtime
         public BoatDamageSync Damage { get; private set; }
         public LightSync Lights { get; private set; }
         public ItemSync Items { get; private set; }
+        public CargoModSync CargoMod { get; private set; }
         public ChartSync Charts { get; private set; }
         public DirtSync Dirt { get; private set; }
         public InteractionSync Interactions { get; private set; }
@@ -198,17 +199,22 @@ namespace SailwindCoop.Runtime
                 ResolveLocalBoatProvider = () => Players.ResolveLocalBoatNow(),
             };
 
+            // Render networked motion at the configured snapshot-buffer point, with no extra
+            // hidden delay, so wheel controls and docking animations stay responsive.
+            Players.InterpDelayMs = Boats.RenderDelayMs;
+
             NpcBoats = new NpcBoatSync(Net);
             Env = new EnvironmentSync(Net);
-            CrestWater = new CrestWaterSync();
+            CrestWater = new CrestWaterSync { RenderDelayMs = Boats.RenderDelayMs };
             Env.Crest = CrestWater;
-            Controls = new ControlsSync(Net);
+            Controls = new ControlsSync(Net) { InterpDelayMs = Boats.RenderDelayMs };
             new BoatAuthority(Net);
             Anchor = new AnchorSync(Net);
             Mooring = new MooringSync(Net);
             Damage = new BoatDamageSync(Net);
             Lights = new LightSync(Net);
             Items = new ItemSync(Net);
+            CargoMod = new CargoModSync(Net);
             Charts = new ChartSync(Net);
             Dirt = new DirtSync(Net);
             Interactions = new InteractionSync(Net);
@@ -293,6 +299,7 @@ namespace SailwindCoop.Runtime
             PatchHealth.Install("BoatActivity", () => BoatActivityPatches.Apply(_harmony), patchFault);
             PatchHealth.Install("Wind sound", () => WindSoundPatches.Apply(_harmony), patchFault);
             PatchHealth.Install("Origin catch-up", () => OriginCatchUp.Apply(_harmony), patchFault);
+            PatchHealth.Install("Crest wave weights", () => CrestWaterSync.Apply(_harmony), patchFault);
             PatchHealth.Install("Game menu", () => GameMenuUI.Apply(_harmony), patchFault);
 
             PatchGuard.Run(() => {
@@ -454,6 +461,7 @@ namespace SailwindCoop.Runtime
                 new SyncStep("Lights.Tick", () => Lights.Tick(_dt)),
                 new SyncStep("Items.Tick", () => Items.Tick(_dt)),
                 new SyncStep("Items.ApplyRemote", () => Items.ApplyRemote()),
+                new SyncStep("CargoMod.Reconcile", () => CargoMod.Tick()),
                 new SyncStep("Charts.Tick", () => Charts.Tick(_dt)),
                 new SyncStep("Dirt.Tick", () => Dirt.Tick(_dt)),
                 new SyncStep("WindTotem.Tick", () => WindTotem.Tick(_dt)),

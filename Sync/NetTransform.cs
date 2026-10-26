@@ -105,13 +105,50 @@ namespace SailwindCoop.Sync
                 {
                     float span = b.Tick - a.Tick;
                     float f = span > 0 ? (renderTick - a.Tick) / span : 0f;
-                    Convert(Vector3.Lerp(a.RealPos, b.RealPos, f), Quaternion.Slerp(a.Rot, b.Rot, f),
+                    Vector3 position = InterpolatePosition(a, b, f, span * 0.001f);
+                    Convert(position, Quaternion.Slerp(a.Rot, b.Rot, f),
                             out pos, out rot);
                     realVel = Vector3.Lerp(a.RealVel, b.RealVel, f);
                     return true;
                 }
             }
             return false;
+        }
+
+        /// <summary>Hermite interpolation uses the host's sampled velocity as the tangent at
+        /// each end of the segment. This avoids the small stop/start in linear interpolation
+        /// whenever a new network snapshot becomes the interpolation bracket.</summary>
+        private static Vector3 InterpolatePosition(Snap a, Snap b, float t, float seconds)
+        {
+            if (seconds <= 0f) return b.RealPos;
+            Vector3 delta = b.RealPos - a.RealPos;
+            float distance = delta.magnitude;
+            if (distance < 0.0001f) return Vector3.Lerp(a.RealPos, b.RealPos, t);
+
+            // Keep noisy packet-derived tangents from bending the boat path away from the
+            // segment. RealVel is measured by finite differences and should normally be close
+            // to the segment velocity; a 2x cap leaves room for real acceleration.
+            Vector3 secant = delta / seconds;
+            float maxTangent = secant.magnitude * 2f;
+            Vector3 v0 = Vector3.ClampMagnitude(a.RealVel, maxTangent) * seconds;
+            Vector3 v1 = Vector3.ClampMagnitude(b.RealVel, maxTangent) * seconds;
+
+            float t2 = t * t, t3 = t2 * t;
+            float h00 = 2f * t3 - 3f * t2 + 1f;
+            float h10 = t3 - 2f * t2 + t;
+            float h01 = -2f * t3 + 3f * t2;
+            float h11 = t3 - t2;
+            Vector3 result = h00 * a.RealPos + h10 * v0 + h01 * b.RealPos + h11 * v1;
+
+            // Bound modest overshoot while preserving the smooth tangent through normal turns.
+            Vector3 padding = Vector3.one * Mathf.Max(0.05f, distance * 0.1f);
+            result.x = Mathf.Clamp(result.x, Mathf.Min(a.RealPos.x, b.RealPos.x) - padding.x,
+                                   Mathf.Max(a.RealPos.x, b.RealPos.x) + padding.x);
+            result.y = Mathf.Clamp(result.y, Mathf.Min(a.RealPos.y, b.RealPos.y) - padding.y,
+                                   Mathf.Max(a.RealPos.y, b.RealPos.y) + padding.y);
+            result.z = Mathf.Clamp(result.z, Mathf.Min(a.RealPos.z, b.RealPos.z) - padding.z,
+                                   Mathf.Max(a.RealPos.z, b.RealPos.z) + padding.z);
+            return result;
         }
 
         private void Convert(Vector3 storedPos, Quaternion storedRot, out Vector3 pos, out Quaternion rot)

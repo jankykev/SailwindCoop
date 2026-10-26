@@ -69,6 +69,15 @@ namespace SailwindCoop.Sync
         public float InterpDelayMs = 100f;
         public int SnapshotHz = 20;
 
+        /// <summary>Use the configured render delay consistently for the boat, players,
+        /// controls and Crest water. Do not add a hidden latency cushion.</summary>
+        public float RenderDelayMs => Mathf.Max(0f, InterpDelayMs);
+
+        // At 20 Hz the 100 ms default has only two snapshots in the render window. A modest
+        // higher floor gives interpolation another sample to bridge scheduling jitter without
+        // adding latency; user-configured higher rates are preserved.
+        private int EffectiveSnapshotHz => Mathf.Max(30, SnapshotHz);
+
         /// <summary>Supplies the player transform that may be REPOSITIONED so the first (potentially
         /// large) boat correction carries them instead of leaving them where the deck used to be. Must
         /// be the real player body — never the camera fallback. Set by the runtime layer.</summary>
@@ -113,8 +122,10 @@ namespace SailwindCoop.Sync
             RefreshHostBoats(dt);
             if (_hostBoats.Count == 0) return;
 
-            float interval = 1f / Mathf.Max(1, SnapshotHz);
-            _sendTimer += dt;
+            float interval = 1f / Mathf.Max(1, EffectiveSnapshotHz);
+            // Network snapshots use real time, not scaled simulation time. Using deltaTime
+            // bunches sends during sleep's time warp and stops them entirely while paused.
+            _sendTimer += Time.unscaledDeltaTime;
             if (_sendTimer < interval) return;
             _sendTimer = 0f;
 
@@ -173,7 +184,7 @@ namespace SailwindCoop.Sync
             }
 
             var cb = EnsureClientBoat(msg.BoatIndex, msg.NetId, boat);
-            cb.Net.InterpDelayMs = InterpDelayMs;
+            cb.Net.InterpDelayMs = RenderDelayMs;
             cb.Net.Push(msg.Tick, msg.RealPos, msg.Rot, msg.RealVel);
         }
 
@@ -193,7 +204,7 @@ namespace SailwindCoop.Sync
                 {
                     if (cb.Net.SampleCount < SamplesBeforeEngage) continue;
                     EngageSlave(cb);
-                    continue;   // EngageSlave already applied this frame's pose
+                    continue;
                 }
 
                 Place(cb);
@@ -219,14 +230,9 @@ namespace SailwindCoop.Sync
             }
             if (!TryClaimBody(cb)) return;
 
-            // Kinematic and not interpolated while we drive the transform directly. With
-            // RigidbodyInterpolation.Interpolate the rendered pose is blended between FIXED-step
-            // physics poses, not the one written this Update, so it oscillates against our writes
-            // with an error proportional to boat velocity — seen as the player/camera bobbing
-            // vertically in time with the swell. BoatPhysicsSwitcher re-enables Interpolate every
-            // LateUpdate (we disable that component while slaved) and the shipyard sets the body's
-            // kinematic flag on its own; BoatHorizon.UpdateKinematic is skipped for a driven body
-            // (NpcBoatPatches). This is the belt-and-braces for all three.
+            // Keep interpolation disabled while writing the authoritative pose each rendered frame.
+            // Rigidbody interpolation blends fixed-step poses against this live network pose and
+            // creates visible oscillation even when the host boat is stationary.
             if (!cb.Rb.isKinematic) cb.Rb.isKinematic = true;
             if (cb.Rb.interpolation != RigidbodyInterpolation.None)
                 cb.Rb.interpolation = RigidbodyInterpolation.None;
@@ -235,7 +241,8 @@ namespace SailwindCoop.Sync
             Vector3 hullOffset = Quaternion.Inverse(body.rotation) * (cb.Boat.position - body.position);
             Quaternion hullInBody = Quaternion.Inverse(body.rotation) * cb.Boat.rotation;
             Quaternion bodyRot = hullRot * Quaternion.Inverse(hullInBody);
-            body.SetPositionAndRotation(hullPos - bodyRot * hullOffset, bodyRot);
+            Vector3 bodyPos = hullPos - bodyRot * hullOffset;
+            body.SetPositionAndRotation(bodyPos, bodyRot);
 
             // RealVel is per second of the host's clock (real time); a body's velocity is per second of
             // game time. They differ under a shared sleep's timeScale 16, which both machines run.

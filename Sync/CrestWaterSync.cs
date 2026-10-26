@@ -2,6 +2,7 @@ using System;
 using System.Reflection;
 using Crest;
 using UnityEngine;
+using HarmonyLib;
 
 namespace SailwindCoop.Sync
 {
@@ -49,11 +50,45 @@ namespace SailwindCoop.Sync
     /// </summary>
     public sealed class CrestWaterSync
     {
+        private static CrestWaterSync _active;
+        private static float[] _remoteWeights;
+        private static float _weightBlendRate = 2f;
+        private static float _remoteCurrentMult;
+        private static bool _haveRemoteCurrentMult;
+        private const float CurrentMultBlendRate = 4f;
+
+        /// <summary>Reapply host spectrum weights after the game's local weather updater runs.</summary>
+        public static void Apply(Harmony harmony)
+        {
+            var method = AccessTools.Method(typeof(OceanUpdaterCrest), "Update");
+            if (method == null) throw new MissingMethodException(typeof(OceanUpdaterCrest).FullName, "Update");
+            harmony.Patch(method, postfix: new HarmonyMethod(typeof(CrestWaterSync), nameof(AfterUpdaterUpdate)));
+        }
+
+        private static void AfterUpdaterUpdate(OceanUpdaterCrest __instance)
+        {
+            if (_active == null || _remoteWeights == null || __instance == null) return;
+            try
+            {
+                var sets = _active.PhaseSets(__instance);
+                float step = _weightBlendRate * Mathf.Max(0f, Time.unscaledDeltaTime);
+                if (sets != null && _remoteWeights != null)
+                    for (int i = 0; i < sets.Length && i < _remoteWeights.Length; i++)
+                        if (sets[i] != null) sets[i]._weight = Mathf.MoveTowards(sets[i]._weight, _remoteWeights[i], step);
+                if (_haveRemoteCurrentMult && CurrentMultField != null)
+                {
+                    float current = (float)CurrentMultField.GetValue(__instance);
+                    float blend = 1f - Mathf.Exp(-CurrentMultBlendRate * Mathf.Max(0f, Time.unscaledDeltaTime));
+                    CurrentMultField.SetValue(__instance, Mathf.Lerp(current, _remoteCurrentMult, blend));
+                }
+            }
+            catch { /* Wave sync must not break the game's updater. */ }
+        }
         /// <summary>Расхождение, после которого часы не подтягиваются, а прыгают (с).</summary>
         private const float SnapSec = 3f;
 
         /// <summary>Доля шага, которую разрешено отдать под догонку за кадр.</summary>
-        private const float SlewFraction = 0.1f;
+        private const float SlewFraction = 0.25f;
 
         private static readonly FieldInfo TimeProviderField =
             typeof(OceanRenderer).GetField("_timeProvider", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -80,11 +115,18 @@ namespace SailwindCoop.Sync
         private float _slewError;
         private float _hostTimeScale = 1f;
         private bool _haveHostTime;
+        private bool _haveTargetHostTime;
+        private float _targetHostTime;
+
+        /// <summary>Keep Crest on the same delayed host time used to render boat poses.</summary>
+        public float RenderDelayMs = 100f;
 
         // --- форма волны --------------------------------------------------------------
         private OceanUpdaterCrest _updater;
         private bool _wavesFailed;
         private bool _directionSeeded;
+        private float[][] _phaseTargets;
+        private bool _phaseTargetsSeeded;
 
         /// <summary>Нужен только ради <c>Clock.ServerTick</c> — см. поправку на возраст снапшота.</summary>
         private Net.CoopNet _net;
@@ -109,6 +151,7 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void Tick()
         {
+            _active = this;
             if (_failed) return;
             try
             {
@@ -121,7 +164,11 @@ namespace SailwindCoop.Sync
                 // надо со старого (он уже мёртв), а ставить на новый.
                 if (_installed && _patched != ocean) Remove();
                 if (!_installed) Install(ocean);
-                if (_installed) AdvanceClock();
+                if (_installed)
+                {
+                    AdvanceClock();
+                    SmoothPhaseCorrection();
+                }
             }
             catch (Exception e)
             {
@@ -149,9 +196,9 @@ namespace SailwindCoop.Sync
             if (_provider == null || _provider.gameObject != ocean.gameObject)
                 _provider = ocean.gameObject.AddComponent<TimeProviderCustom>();
 
-            // Стартуем с текущего времени океана, а не с нуля: иначе первый же кадр даст скачок фазы
-            // на десятки секунд.
-            _provider._time = ocean.CurrentTime;
+            // Start at the host's buffered render time, not local time or zero, so the water and
+            // boat use the same frame from the first snapshot.
+            _provider._time = _haveTargetHostTime ? _targetHostTime : ocean.CurrentTime;
             _provider._deltaTime = Time.deltaTime;
             _slewError = 0f;
 
@@ -255,22 +302,27 @@ namespace SailwindCoop.Sync
             if (!msg.HasCrest) return;
             _haveHostTime = true;
 
-            // Часы. CrestOceanTime снят хостом в момент ОТПРАВКИ, а доехал он за полпути RTT и
-            // пролежит до следующего снапшота (4 Гц). Догонять голое значение — значит сойтись к
-            // «времени хоста в прошлом» и застыть там: замер показал устойчивое отставание 0,71 с
-            // при slewError = 0, то есть часы честно сошлись к устаревшей цели. Добавляем возраст
-            // снапшота по сетевым часам (msg.Tick снят хостом в том же кадре), и цель становится
-            // «время хоста СЕЙЧАС». Это поправка только к цели — ни на монотонность, ни на скорость
-            // подтягивания она не влияет.
+            // Account for transit and snapshot age, then use the same delayed host time as the
+            // boat pose buffer. This target also seeds a newly installed provider on the first
+            // snapshot, avoiding several seconds of local-time water after joining.
+            float age = (_net != null ? (_net.Clock.ServerTick - msg.Tick) : 0L) * 0.001f;
+            if (age < 0f) age = 0f;
+            if (age > 1f) age = 1f;   // a reconnect gap must not fast-forward the ocean
+            _targetHostTime = msg.CrestOceanTime + age * _hostTimeScale - RenderDelayMs * 0.001f;
+            _haveTargetHostTime = true;
+
             if (_installed && _provider != null)
             {
-                float age = (_net != null ? (_net.Clock.ServerTick - msg.Tick) : 0L) * 0.001f;
-                if (age < 0f) age = 0f;
-                if (age > 1f) age = 1f;   // разрыв связи не должен разгонять воду
-                float err = (msg.CrestOceanTime + age * _hostTimeScale) - _provider._time;
+                // BoatSync renders the host boat behind server-now by its interpolation delay.
+                // Render Crest at that same point in host time; otherwise a slaved boat can appear
+                // under or above a fast-moving local wave despite having the correct host pose.
+                float err = _targetHostTime - _provider._time;
                 if (Mathf.Abs(err) > SnapSec)
                 {
-                    _provider._time = msg.CrestOceanTime;
+                    // Use the same latency-compensated target that produced err. Snapping to
+                    // the raw send-time value reintroduced up to one snapshot interval of lag
+                    // exactly when a larger correction was needed.
+                    _provider._time = _targetHostTime;
                     _slewError = 0f;
                 }
                 else _slewError = err;
@@ -302,13 +354,15 @@ namespace SailwindCoop.Sync
                     _directionSeeded = true;
                 }
 
-                CurrentMultField.SetValue(updater, msg.CrestCurrentMult);
+                _remoteCurrentMult = msg.CrestCurrentMult;
+                _haveRemoteCurrentMult = true;
 
                 // Вес ветровых волн — не присваиванием: снапшоты идут 4 Гц, а жёсткая запись видна
                 // как ступенька на поверхности. MoveTowards ограничивает скорость изменения.
-                var windWaves = (ShapeGerstnerBatched)WindWavesField.GetValue(updater);
-                if (windWaves != null)
-                    windWaves._weight = Mathf.MoveTowards(windWaves._weight, msg.CrestWindWavesWeight, 0.25f);
+                // Set a target; the updater postfix blends all spectrum weights every frame,
+                // after vanilla has updated them from local weather.
+                if (_remoteWeights == null || _remoteWeights.Length != 3) _remoteWeights = new float[3];
+                _remoteWeights[0] = msg.CrestWindWavesWeight;
             }
             catch (Exception e)
             {
@@ -332,10 +386,10 @@ namespace SailwindCoop.Sync
         // Клиент перенимает массив хоста целиком. Подробнее: Net.WavePhasesMsg.
         // =================================================================================
 
-        /// <summary>Как часто хост переотправляет фазы. Между отправками локальные сдвиги начала
-        /// координат снова слегка разводят массивы, но сдвиг — событие редкое, и направление волн
-        /// теперь синхронно, так что расхождение за интервал мало.</summary>
-        private const float PhaseResendSec = 5f;
+        /// <summary>Refresh the host's phase arrays four times a second. Crest adds floating-origin
+        /// compensation to these arrays locally, so a one-second refresh can leave enough spatial
+        /// phase drift for a fast-moving boat to look detached from the visible surface offshore.</summary>
+        private const float PhaseResendSec = 0.25f;
 
         private float _phaseSendStamp = float.NegativeInfinity;
         private Runtime.CoopLog.Repeat _phaseReport;
@@ -361,9 +415,14 @@ namespace SailwindCoop.Sync
             {
                 var sets = PhaseSets(updater);
                 if (sets == null) return;
-                var msg = new Net.WavePhasesMsg { Sets = new float[sets.Length][] };
+                var msg = new Net.WavePhasesMsg { Sets = new float[sets.Length][], Seeds = new int[sets.Length], Weights = new float[sets.Length] };
                 for (int i = 0; i < sets.Length; i++)
-                    msg.Sets[i] = sets[i] != null ? sets[i]._phases : null;
+                {
+                    var set = sets[i];
+                    msg.Sets[i] = set != null ? set._phases : null;
+                    msg.Seeds[i] = set != null ? set._randomSeed : 0;
+                    msg.Weights[i] = set != null ? set._weight : 0f;
+                }
                 net.Broadcast(msg, LiteNetLib.DeliveryMethod.ReliableOrdered);
             }
             catch (Exception e)
@@ -383,23 +442,73 @@ namespace SailwindCoop.Sync
             {
                 var sets = PhaseSets(updater);
                 if (sets == null) return;
+                if (_remoteWeights == null || _remoteWeights.Length != sets.Length) _remoteWeights = new float[sets.Length];
                 for (int i = 0; i < sets.Length && i < msg.Sets.Length; i++)
                 {
                     var set = sets[i];
+                    if (set != null && msg.Seeds != null && i < msg.Seeds.Length && set._randomSeed != msg.Seeds[i])
+                    {
+                        set._randomSeed = msg.Seeds[i];
+                        set.UpdateWaveData();
+                    }
+                    if (set != null && msg.Weights != null && i < msg.Weights.Length)
+                        _remoteWeights[i] = msg.Weights[i];
                     var src = msg.Sets[i];
                     if (set == null || src == null || src.Length == 0) continue;
                     // Длина равна _componentsPerOctave*14 и берётся из сцены, одинаковой у обеих
                     // машин. Не совпала — значит предположение неверно, и писать чужой массив
                     // опаснее, чем оставить свой.
                     if (set._phases == null || set._phases.Length != src.Length) continue;
-                    Array.Copy(src, set._phases, src.Length);
+                    if (_phaseTargets == null || _phaseTargets.Length != sets.Length)
+                        _phaseTargets = new float[sets.Length][];
+                    if (_phaseTargets[i] == null || _phaseTargets[i].Length != src.Length)
+                        _phaseTargets[i] = new float[src.Length];
+
+                    // The first host phase packet establishes the shared surface immediately.
+                    // Later packets only change the target: writing the full array every 250 ms
+                    // made Crest's surface jump, which can shake the client boat's rigging.
+                    if (!_phaseTargetsSeeded)
+                        Array.Copy(src, set._phases, src.Length);
+                    Array.Copy(src, _phaseTargets[i], src.Length);
                 }
+                _phaseTargetsSeeded = true;
                 PhasesApplied = true;
             }
             catch (Exception e)
             {
                 Plugin.Logger.ReportError("[CrestWaterSync] Could not apply wave phases",
                                           e.Message, ref _phaseReport);
+            }
+        }
+
+        /// <summary>Ease floating-origin phase corrections between host snapshots. This changes
+        /// only the synchronization offset; Crest still computes and renders the same wave spectrum.</summary>
+        private void SmoothPhaseCorrection()
+        {
+            if (!_phaseTargetsSeeded || _phaseTargets == null) return;
+            var updater = Updater();
+            if (updater == null) return;
+            var sets = PhaseSets(updater);
+            if (sets == null) return;
+
+            // A 250 ms packet interval should not create a 4 Hz discontinuity in the visible sea.
+            // Correct phase over a few frames while leaving wave amplitude, frequency and shape intact.
+            // Keep corrections continuous over several environment packets. A faster response
+            // kept the waterline aligned but made small phase updates visible as a shimmer.
+            float blend = 1f - Mathf.Exp(-6f * Mathf.Max(0f, Time.deltaTime));
+            for (int i = 0; i < sets.Length && i < _phaseTargets.Length; i++)
+            {
+                var waveSet = sets[i];
+                var target = _phaseTargets[i];
+                if (waveSet == null || waveSet._phases == null || target == null ||
+                    waveSet._phases.Length != target.Length) continue;
+
+                for (int j = 0; j < target.Length; j++)
+                {
+                    float current = waveSet._phases[j];
+                    float delta = Mathf.Repeat(target[j] - current + Mathf.PI, 2f * Mathf.PI) - Mathf.PI;
+                    waveSet._phases[j] = current + delta * blend;
+                }
             }
         }
 
@@ -469,6 +578,10 @@ namespace SailwindCoop.Sync
         /// <summary>Полный сброс на отключении: провайдер снят, состояние забыто.</summary>
         public void Clear()
         {
+            if (_active == this) _active = null;
+            _remoteWeights = null;
+            _haveRemoteCurrentMult = false;
+            _remoteCurrentMult = 0f;
             Remove();
             if (_provider != null)
             {
@@ -479,7 +592,11 @@ namespace SailwindCoop.Sync
             _directionSeeded = false;
             _wavesFailed = false;
             _failed = false;
+            _phaseTargets = null;
+            _phaseTargetsSeeded = false;
             _haveHostTime = false;
+            _haveTargetHostTime = false;
+            _targetHostTime = 0f;
             _hostTimeScale = 1f;
             _slewError = 0f;
             for (int i = 0; i < 9; i++) { _probeValid[i] = false; _probeHeights[i] = 0f; }
