@@ -1000,7 +1000,10 @@ namespace SailwindCoop.Sync
                 var ie = HostLookup(msg.InstanceId, msg.PrefabIndex);
                 if (ie != null && ie.Item != null)
                 {
-                    ApplyCrateMembership(ie.Item, msg.CrateId);
+                    // Use the host's crate InstanceId for this item (from item.currentCrateId),
+                    // not the client's crate InstanceId from the message (which differs for runtime-spawned crates).
+                    var crateId = CrateIdOf(ie.Item);
+                    ApplyCrateMembership(ie.Item, crateId);
                     // Insert/withdraw completes the item's storage action. A separate Drop may
                     // follow, but must not leave the host treating a stored item as still held.
                     ie.HolderNetId = 0;
@@ -1008,7 +1011,7 @@ namespace SailwindCoop.Sync
                     _localHeld.Remove(ie.Item);
                     ie.Item.held = null;
                     _net.Broadcast(BuildState(ie, _net.Clock.ServerTick), LiteNetLib.DeliveryMethod.ReliableOrdered);
-                    Remember("in crate #" + ie.Index + "->" + msg.CrateId + " actor=" + actor);
+                    Remember("in crate #" + ie.Index + "->" + crateId + " actor=" + actor);
                 }
                 else Remember("reject crate id=" + msg.InstanceId);
                 return;
@@ -2313,6 +2316,14 @@ namespace SailwindCoop.Sync
             try { target.InsertItem(item); }
             finally { ApplyingCrate = false; }
         }
+        private void ReassertCrateInsert(ShipItem item, int crateId, int cratePrefabIndex)
+        {
+            var target = CrateInventoryFor(crateId, cratePrefabIndex);
+            if (item == null || target == null) return;
+            ApplyingCrate = true;
+            try { target.InsertItem(item); }
+            finally { ApplyingCrate = false; }
+        }
         private void ReassertCrateInsertIfNeeded(ShipItem item, int crateId)
         {
             var target = CrateInventoryFor(crateId);
@@ -2324,13 +2335,25 @@ namespace SailwindCoop.Sync
             bool physicsMismatch = !irb.attached || !irb.disableCol || !irb.inStove;
             bool membershipMismatch = saveable.currentCrateId != crateId || !target.containedItems.Contains(item);
             if (scaleMismatch || physicsMismatch || membershipMismatch || !CrateLayerMatches(item))
-                ReassertCrateInsert(item, crateId);
+            {
+                var crateEntry = _byInstanceId.TryGetValue(crateId, out var ce) ? ce : null;
+                int cratePrefabIndex = crateEntry != null ? crateEntry.PrefabIndex : 0;
+                ReassertCrateInsert(item, crateId, cratePrefabIndex);
+            }
         }
         private ItemApplyStatus TryApplyCrateMembership(ShipItem item, int crateId)
         {
             if (item == null) return ItemApplyStatus.Pending;
             var sv = item.GetComponent<SaveablePrefab>();
-            var target = CrateInventoryFor(crateId);
+            // For fallback: get the crate's prefabIndex from the item's current crate (if any)
+            int cratePrefabIndex = 0;
+            if (sv != null && sv.currentCrateId != 0)
+            {
+                var currentCrateEntry = _byInstanceId.TryGetValue(sv.currentCrateId, out var e) ? e : null;
+                if (currentCrateEntry?.Item != null)
+                    cratePrefabIndex = currentCrateEntry.PrefabIndex;
+            }
+            var target = CrateInventoryFor(crateId, cratePrefabIndex);
             return _crateMembership.Apply(item,
                 () => sv != null && sv.currentCrateId == crateId && CrateListsMatch(item, target) && (crateId == 0 ||
                     (target != null && target.containedItems.Contains(item) && CrateVisualMatches(item))),
@@ -2373,6 +2396,25 @@ namespace SailwindCoop.Sync
         {
             return id != 0 && _byInstanceId.TryGetValue(id, out var entry) && entry.Item != null
                 ? entry.Item.GetComponent<CrateInventory>() : null;
+        }
+        private CrateInventory CrateInventoryFor(int id, int cratePrefabIndex = 0)
+        {
+            if (id != 0 && _byInstanceId.TryGetValue(id, out var entry) && entry.Item != null)
+                return entry.Item.GetComponent<CrateInventory>();
+            // Fallback: runtime-spawned crates (bought from trade office) may have different InstanceIds
+            // on host vs client. Search for a crate with matching prefab.
+            if (id != 0 && cratePrefabIndex != 0)
+            {
+                foreach (var entry2 in _byInstanceId.Values)
+                {
+                    if (entry2.Item is ShipItemCrate crate && entry2.PrefabIndex == cratePrefabIndex)
+                    {
+                        // Found a crate with same prefab — assume it's the same logical crate
+                        return crate.GetComponent<CrateInventory>();
+                    }
+                }
+            }
+            return null;
         }
         // Asked for every incoming item state: resolve the crates once per frame, not once per packet.
         private readonly List<CrateInventory> _crateScan = new List<CrateInventory>();
@@ -3697,6 +3739,24 @@ namespace SailwindCoop.Sync
         {
             if (instanceId <= 0 || prefabIndex <= 0) return null;
             if (_byInstanceId.TryGetValue(instanceId, out var e) && e.PrefabIndex == prefabIndex) return e;
+            // Fallback: runtime-spawned crates (bought from trade office) may have different InstanceIds
+            // on host vs client. Search for a crate with matching prefab.
+            if (prefabIndex > 0)
+            {
+                var dir = PrefabsDirectory.instance;
+                if (dir != null && dir.directory != null && prefabIndex < dir.directory.Length)
+                {
+                    var prefab = dir.directory[prefabIndex];
+                    if (prefab.GetComponent<ShipItemCrate>() != null)
+                    {
+                        foreach (var entry in _byInstanceId.Values)
+                        {
+                            if (entry.Item is ShipItemCrate && entry.PrefabIndex == prefabIndex)
+                                return entry;
+                        }
+                    }
+                }
+            }
             return null;
         }
 
