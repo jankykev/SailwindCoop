@@ -2,6 +2,50 @@
 
 All notable user-facing changes are documented in this file.
 
+## [Unreleased] - Commit 526ca55 (main, 2026-11-02)
+
+### Fixed
+
+- Crate unseal UI: InstanceId mismatch for trade office crates resolved; Client can now unseal crates
+- Crate UI layer handling and refresh buttons: overflow items no longer leave phantom interactable items; hidden button references cleared
+- 16-slot sealed crate UI/emptying: all 16 items now work correctly
+- Cross-player crate withdrawal: Client puts in, Host withdraws — no longer freezes/invisible
+- Hook repeated swaps: snap-back/fall-through/frozen drops resolved
+- Host belt withdrawal → drop selectability: items dropped from belt now pickable by Client
+- Belt item visual scaling/jitter: items in belt now stable (world-frame pose fix)
+- SettleDepenetration: drops settle without excessive bounce
+- "Populating buttons" UI spam during crate open/unseal eliminated
+- General debug log volume significantly reduced
+- Client-held items frozen on Host (stale-lease): resolved
+- Client crate scaling/collisions: fixed
+- Client mug/bucket water-state loss: fixed — mugs retain water, no auto-empty on pickup
+- Host pause now pauses Client simulation (desync prevention)
+- Shop crate/barrel bought by Client: physics no longer break on drop
+- Client belt → drop freeze: resolved
+- Client grab crate/barrel glitch position: resolved
+- Trade goods bought by Client no longer inherit mission index (CargoController compatibility)
+- Items no longer drop through boat or world
+- Crate reset position glitch on Client grab: resolved
+
+### Changed
+
+- Crate UI refresh now clears hidden button references before vanilla overwrite
+- Hook attachment physics: initial selection works (Host can grab Client-placed items)
+- Anchor interaction: Client can now select anchor (reel-in still broken)
+- Item drop physics generally improved — dropping feels good, just need Client pause before drop
+
+### Known Issues (see KNOWN_ISSUES.md)
+
+- Hook physics cascade: Host places→Client grabs→drop freezes; Client places→Host can't grab; anchor reel-in broken; item falls through→glides
+- Client drop latency: ~250-300ms on any Client drop (not crate-specific)
+- Lantern belt light: bidirectional broken (neither direction works)
+- Boat/ocean smoothing: sail jitter, ocean not smooth, networking timing
+- ExitBoat log spam when Client holds item
+- Mooring knot offset/snap-back (GetSiblingIndex non-deterministic)
+- Host mug placement regression: 45° on side, tips/leaks
+- Crate fall desync: Client/Host render separate drops (regression)
+- Held items jitter tied to boat movement
+
 ## [0.6.1] - 2026-10-26
 
 ### Fixed
