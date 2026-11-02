@@ -52,6 +52,8 @@ namespace SailwindCoop.Sync
             TryPatch(harmony, hooks, typeof(CrateInventory), "WithdrawItem", new[] { typeof(ShipItem) }, postfixName: nameof(PostCrateWithdraw));
             TryPatch(harmony, hooks, typeof(ShipItemCrate), "UnsealCrate", Type.EmptyTypes, prefixName: nameof(PreUnseal));
             TryPatch(harmony, hooks, typeof(CrateInventoryUI), "ShowInventory", new[] { typeof(CrateInventory) }, prefixName: nameof(PreShowInventory));
+            TryPatch(harmony, hooks, typeof(CrateInventoryUI), "RefreshButtons", Type.EmptyTypes,
+                prefixName: nameof(PreRefreshCrateButtons), postfixName: nameof(PostRefreshCrateButtons));
             // Cargo load/unload uses each player's OWN wallet (local money) → vanilla runs locally; we only
             // mirror the resulting membership (like crates). Postfix on insert; withdraw captures the item
             // in a prefix (it isn't an argument) and forwards it in the postfix.
@@ -602,6 +604,20 @@ namespace SailwindCoop.Sync
         {
             try { return !ItemSync.DropsCrateWindow(__0); }
             catch (Exception e) { WarnPatch("[ItemPatches] PreShowInventory: " + e.Message); return true; }
+        }
+
+        private static void PreRefreshCrateButtons(CrateInventoryUI __instance)
+        {
+            // Vanilla clears only visible buttons; hidden ones can retain a withdrawn item.
+            foreach (var button in __instance.buttons)
+                if (!button.gameObject.activeSelf) button.ShowItem(null);
+        }
+
+        private static void PostRefreshCrateButtons(CrateInventoryUI __instance)
+        {
+            // Vanilla also assigns overflow contents to hidden buttons. Keep them in the crate.
+            foreach (var button in __instance.buttons)
+                if (!button.gameObject.activeSelf) button.PutItemBack(__instance.currentCrate);
         }
 
         // Cargo load/unload runs locally (own wallet); we only mirror the resulting membership.

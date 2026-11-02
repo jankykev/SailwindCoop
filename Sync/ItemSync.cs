@@ -2323,7 +2323,7 @@ namespace SailwindCoop.Sync
             bool scaleMismatch = (item.transform.localScale - expectedScale).sqrMagnitude > 0.0001f;
             bool physicsMismatch = !irb.attached || !irb.disableCol || !irb.inStove;
             bool membershipMismatch = saveable.currentCrateId != crateId || !target.containedItems.Contains(item);
-            if (scaleMismatch || physicsMismatch || membershipMismatch || item.gameObject.layer != 26)
+            if (scaleMismatch || physicsMismatch || membershipMismatch || !CrateLayerMatches(item))
                 ReassertCrateInsert(item, crateId);
         }
         private ItemApplyStatus TryApplyCrateMembership(ShipItem item, int crateId)
@@ -2356,9 +2356,18 @@ namespace SailwindCoop.Sync
         {
             if (item == null) return false;
             var irb = item.GetItemRigidbody();
-            if (irb == null || !irb.attached || !irb.disableCol || !irb.inStove || item.gameObject.layer != 26) return false;
+            if (irb == null || !irb.attached || !irb.disableCol || !irb.inStove || !CrateLayerMatches(item)) return false;
             Vector3 expectedScale = Vector3.one * (item.inventoryScale * 0.33f);
             return (item.transform.localScale - expectedScale).sqrMagnitude <= 0.0001f;
+        }
+        private static bool CrateLayerMatches(ShipItem item)
+        {
+            if (item.gameObject.layer == 26) return true;
+            var ui = CrateInventoryUI.instance;
+            if (item.gameObject.layer != 2 || ui == null || !ui.showingUI || ui.currentCrate == null) return false;
+            // ShowItem uses layer 2 for visible contents; this is not a broken insertion.
+            int index = ui.currentCrate.containedItems.IndexOf(item);
+            return index >= 0 && index < ui.buttons.Length && ui.buttons[index].gameObject.activeInHierarchy;
         }
         private CrateInventory CrateInventoryFor(int id)
         {
