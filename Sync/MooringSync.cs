@@ -252,17 +252,6 @@ namespace SailwindCoop.Sync
             if (ropes == null || msg.Index >= ropes.Length || ropes[msg.Index] == null)
             { SendMissingObject(msg, actor); return; }
             _dockRequests.Remove(msg.Index);
-            if (msg.Kind == MooringKind.Moor)
-            {
-                _dockRequests[msg.Index] = new DeferredDock
-                {
-                    Request = msg,
-                    Actor = actor,
-                    ApplyAfterTime = Time.time + MooringVisualSettleDelay
-                };
-                SendWaitingDock(msg, actor);
-                return;
-            }
             if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in request", applyMoorLength: false))
             { _dockRequests[msg.Index] = new DeferredDock { Request = msg, Actor = actor }; SendWaitingDock(msg, actor); return; }
             SendRopeState(msg.Index, actor, msg.RequestId);

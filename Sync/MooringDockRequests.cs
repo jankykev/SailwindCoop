@@ -8,9 +8,8 @@ namespace SailwindCoop.Sync
 {
     public sealed partial class MooringSync
     {
-        private sealed class DeferredDock { internal MooringRequestMsg Request; internal uint Actor; internal float ApplyAfterTime; }
+        private sealed class DeferredDock { internal MooringRequestMsg Request; internal uint Actor; }
         private readonly Dictionary<ushort, DeferredDock> _dockRequests = new Dictionary<ushort, DeferredDock>();
-        private const float MooringVisualSettleDelay = 0.2f;
         private static string DockIdentity(GPButtonDockMooring dock)
         {
             if (dock == null) return "";
@@ -37,7 +36,6 @@ namespace SailwindCoop.Sync
             foreach (var pair in new List<KeyValuePair<ushort, DeferredDock>>(_dockRequests))
             {
                 var msg = pair.Value.Request;
-                if (Time.time < pair.Value.ApplyAfterTime) continue;
                 if (FindDock(msg.DockReal) == null) continue;
                 if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in deferred request", applyMoorLength: false)) continue;
                 _dockRequests.Remove(pair.Key);
