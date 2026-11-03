@@ -301,10 +301,13 @@ namespace SailwindCoop.Sync
             if (ropes == null || index >= ropes.Length || ropes[index] == null) return;
             var rope = ropes[index];
             bool held = IsLocallyHeld(rope) || CarryPending(index);
-            state.TryApply(held, msg => Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in", recordInteraction: msg.IsInteraction));
+            state.TryApply(held, msg => Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in",
+                recordInteraction: msg.IsInteraction,
+                sendMoorPoseCorrection: msg.Kind == MooringKind.Moor && msg.IsInteraction && msg.RequesterNetId == _net.MyNetId));
         }
 
-        private bool Apply(ushort index, MooringKind kind, Vector3 dockReal, float lengthSq, string tag, bool applyMoorLength = true, bool recordInteraction = true)
+        private bool Apply(ushort index, MooringKind kind, Vector3 dockReal, float lengthSq, string tag, bool applyMoorLength = true,
+            bool recordInteraction = true, bool sendMoorPoseCorrection = false)
         {
             var ropes = _bm != null ? _bm.ropes : null;
             if (ropes == null || index >= ropes.Length) { RefetchBoat(); ropes = _bm != null ? _bm.ropes : null; }
@@ -349,6 +352,8 @@ namespace SailwindCoop.Sync
                         changed |= !rope.currentRopeLengthSquared.Equals(lengthSq);
                         ApplyLength(rope, lengthSq);
                     }
+                    if (sendMoorPoseCorrection && _net.Role == Role.Client && rope.IsMoored())
+                        SendMooringPoseCorrection(index);
                 }
                 else // Length — set the authoritative rope length + spring distance (only while moored)
                 {

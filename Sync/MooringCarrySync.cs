@@ -79,17 +79,31 @@ namespace SailwindCoop.Sync
             msg.HolderNetId = local ? _net.MyNetId : carry.Holder; msg.Held = msg.HolderNetId != 0;
             msg.FromDock = carry.FromDock; msg.LinkPending = _dockRequests.ContainsKey(carry.Index);
         }
-        private void SendCarryRequest(Carry carry, MooringCarryAction action)
+        private void SendCarryRequest(Carry carry, MooringCarryAction action, bool forceWorldPose = false)
         {
             if (action != MooringCarryAction.Pose)
             { if (++_nextRequestId == 0) ++_nextRequestId; carry.Request = _nextRequestId; carry.Gate.Begin(carry.Request); }
             var msg = new MooringCarryRequestMsg { Action = action, RequestId = carry.Request };
             CaptureCarry(carry, msg);
+            if (forceWorldPose)
+            {
+                msg.Held = false; msg.HolderNetId = 0; msg.LinkPending = false;
+                msg.Frame = CoordFrame.World; msg.Tick = _net.Clock.ServerTick;
+                msg.Pos = CoordSpace.LocalToReal(carry.Item.transform.position);
+                msg.Rot = carry.Item.transform.rotation; msg.Vel = Vector3.zero;
+            }
             // The held-pose pass repeats nothing: a rope carried without moving sends no packet.
             if (action == MooringCarryAction.Pose && carry.Sent && msg.Frame == carry.SentFrame &&
                 (msg.Pos - carry.SentPos).sqrMagnitude <= 1e-6f && Quaternion.Angle(msg.Rot, carry.SentRot) <= 0.1f) return;
             carry.Sent = true; carry.SentPos = msg.Pos; carry.SentRot = msg.Rot; carry.SentFrame = msg.Frame;
             _net.Broadcast(msg, DeliveryMethod.ReliableOrdered);
+        }
+        private void SendMooringPoseCorrection(ushort index)
+        {
+            if (_net.Role != Role.Client || !CoordSpace.Ready) return;
+            var carry = CarryFor(index, 0);
+            if (carry?.Item == null || carry.Item.held != null) return;
+            SendCarryRequest(carry, MooringCarryAction.Pose, forceWorldPose: true);
         }
         private void SendCarryState(Carry carry, bool reliable, bool periodic = false)
         {
@@ -163,19 +177,32 @@ namespace SailwindCoop.Sync
             {
                 using (InteractionContext.Begin(InteractionSource.RemoteApply))
                 {
-                    if (msg.Held && msg.Part == 0 && _bm.ropes[msg.Index].IsMoored())
+                    // The initiating client reports its final docked endpoint as a one-shot pose,
+                    // not a drop/return action.
+                    if (msg.Action == MooringCarryAction.Pose && !msg.Held && msg.Part == 0 &&
+                        msg.Frame == CoordFrame.World && _bm.ropes[msg.Index].IsMoored())
                     {
-                        _bm.ropes[msg.Index].Unmoor();
-                        unmoored = true;
+                        carry.Pose.Clear();
+                        carry.Item.transform.position = CoordSpace.RealToLocal(msg.Pos);
+                        carry.Item.transform.rotation = msg.Rot;
+                        RestoreCarry(carry);
                     }
-                    SlaveCarry(carry); carry.Pose.Apply(carry.Item.transform, _net.Clock.ServerTick);
-                    // A drop runs the game's own return sequence, which reads the rope attachment and
-                    // resets the visual itself when it ends. Resetting the visual first clears that
-                    // attachment: the sequence then throws on its first step and the part stays where
-                    // it was dropped, with its collider off, for the rest of the session.
-                    if (!msg.Held)
-                    { RestoreCarry(carry); carry.Item.OnDrop(); }
-                    else if (msg.Action != MooringCarryAction.Pose || previousFromDock != carry.FromDock) UpdateCarryVisual(carry, previous);
+                    else
+                    {
+                        if (msg.Held && msg.Part == 0 && _bm.ropes[msg.Index].IsMoored())
+                        {
+                            _bm.ropes[msg.Index].Unmoor();
+                            unmoored = true;
+                        }
+                        SlaveCarry(carry); carry.Pose.Apply(carry.Item.transform, _net.Clock.ServerTick);
+                        // A drop runs the game's own return sequence, which reads the rope attachment and
+                        // resets the visual itself when it ends. Resetting the visual first clears that
+                        // attachment: the sequence then throws on its first step and the part stays where
+                        // it was dropped, with its collider off, for the rest of the session.
+                        if (!msg.Held)
+                        { RestoreCarry(carry); carry.Item.OnDrop(); }
+                        else if (msg.Action != MooringCarryAction.Pose || previousFromDock != carry.FromDock) UpdateCarryVisual(carry, previous);
+                    }
                 }
             }
             if (msg.Action != MooringCarryAction.Pose)

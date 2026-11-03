@@ -1,6 +1,6 @@
 # Mooring Knot Offset / Snap-Back — Commit 526ca55
 
-**Status:** PRESENT — SECOND ATTEMPT UNVERIFIED (Medium) | **Tested:** 2026-11-02 | **Baseline:** e887060 → **Current:** 526ca55
+**Status:** PRESENT — POSITION CORRECTION ATTEMPT UNVERIFIED (Medium) | **Tested:** 2026-11-02 | **Baseline:** e887060 → **Current:** 526ca55
 
 ---
 
@@ -35,9 +35,9 @@ Mooring rope knot position was reported as non-deterministic across machines, wi
 
 ## Investigation and Fix Attempts
 
-The first attempt changed `DockIdentity` to a rounded real-space position but did not resolve the reported behavior and was reverted. A hierarchy-path match can still select the wrong dock, so the current attempt makes the transmitted real-space position authoritative for dock lookup.
+The first attempt changed `DockIdentity` to a rounded real-space position but did not resolve the reported behavior and was reverted. The current dock lookup uses the transmitted real-space position rather than trusting the hierarchy path.
 
-Client pickup can also unmoor the host's rope through the carry protocol before a separate mooring request arrives. The current attempt immediately broadcasts the host's resulting rope state rather than waiting for the periodic snapshot.
+Client pickup can also unmoor the host's rope through the carry protocol before a separate mooring request arrives; that transition is broadcast immediately. A host-side delay did not fix the visual offset and was reverted. The current attempt sends the initiating client's post-moor world-space rope pose after the host's moor acknowledgement, then applies that pose to the host's moored endpoint.
 
 This attempt is **not marked fixed** until a build/deploy succeeds and host/client in-game checks confirm the snap-back and knot placement criteria.
 
