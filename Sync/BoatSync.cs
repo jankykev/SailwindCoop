@@ -44,8 +44,10 @@ namespace SailwindCoop.Sync
             /// game reads it for the wake, foam, hull sounds and apparent wind.</summary>
             public Vector3 Velocity;
             public Vector3 AngularVelocity;
+            public Vector3 TransitionVelocity;
             public Quaternion LastBodyRot;
             public bool HaveLastRot;
+            public bool HasAppliedPose;
             /// <summary>False while we are only buffering: physics is still vanilla and we apply nothing.</summary>
             public bool Engaged;
         }
@@ -68,6 +70,7 @@ namespace SailwindCoop.Sync
 
         public float InterpDelayMs = 100f;
         public int SnapshotHz = 20;
+        public float TransitionMs = 75f;
 
         /// <summary>Use the configured render delay consistently for the boat, players,
         /// controls and Crest water. Do not add a hidden latency cushion.</summary>
@@ -224,8 +227,7 @@ namespace SailwindCoop.Sync
 
             if (cb.Rb == null)
             {
-                cb.Boat.position = hullPos;
-                cb.Boat.rotation = hullRot;
+                ApplyTransition(cb, cb.Boat, hullPos, hullRot);
                 return;
             }
             if (!TryClaimBody(cb)) return;
@@ -242,13 +244,31 @@ namespace SailwindCoop.Sync
             Quaternion hullInBody = Quaternion.Inverse(body.rotation) * cb.Boat.rotation;
             Quaternion bodyRot = hullRot * Quaternion.Inverse(hullInBody);
             Vector3 bodyPos = hullPos - bodyRot * hullOffset;
-            body.SetPositionAndRotation(bodyPos, bodyRot);
+            ApplyTransition(cb, body, bodyPos, bodyRot);
 
             // RealVel is per second of the host's clock (real time); a body's velocity is per second of
             // game time. They differ under a shared sleep's timeScale 16, which both machines run.
             cb.Velocity = vel / Mathf.Max(Time.timeScale, 0.0001f);
             cb.AngularVelocity = AngularVelocity(cb, bodyRot);
             SetMotion(cb);
+        }
+
+        private void ApplyTransition(ClientBoat cb, Transform target, Vector3 position, Quaternion rotation)
+        {
+            float smoothTime = Mathf.Max(0f, TransitionMs) * 0.001f;
+            if (!cb.HasAppliedPose || smoothTime <= 0f)
+            {
+                target.SetPositionAndRotation(position, rotation);
+                cb.TransitionVelocity = Vector3.zero;
+                cb.HasAppliedPose = true;
+                return;
+            }
+
+            float dt = Time.unscaledDeltaTime;
+            target.position = Vector3.SmoothDamp(
+                target.position, position, ref cb.TransitionVelocity, smoothTime, Mathf.Infinity, dt);
+            target.rotation = Quaternion.Slerp(
+                target.rotation, rotation, 1f - Mathf.Exp(-dt / smoothTime));
         }
 
         /// <summary>A rotation step faster than this (rad/s) is a teleport, not a turn.</summary>

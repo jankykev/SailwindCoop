@@ -186,6 +186,7 @@ namespace SailwindCoop.Runtime
             {
                 InterpDelayMs = Plugin.Cfg.InterpDelayMs.Value,
                 SnapshotHz = Plugin.Cfg.SnapshotHz.Value,
+                TransitionMs = Plugin.Cfg.BoatSmoothingMs.Value,
                 // Lets the first (potentially huge) boat correction carry us instead of dropping us
                 // through the deck. Sync layers stay decoupled: BoatSync asks, it doesn't reach in.
                 //

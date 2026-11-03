@@ -74,6 +74,9 @@ namespace SailwindCoop.Sync
             public bool HaveLast;
             public CoordFrame LastFrame;
             public ushort LastBoatIndex;
+            public bool HaveHostPoseFrame;
+            public CoordFrame HostPoseFrame;
+            public ushort HostPoseBoatIndex;
             public bool WasActive;   // host: was streaming this item last tick (to send a final resting pose)
             public int InventorySlot = -1;
             public bool DropWithoutProxyVelocity;
@@ -412,7 +415,9 @@ namespace SailwindCoop.Sync
 
         public void ApplyRemote()
         {
-            if (_net.Role != Role.Client) return;
+            bool client = _net.Role == Role.Client;
+            bool host = _net.Role == Role.Host;
+            if (!client && !host) return;
             if (!CoordSpace.Ready) return;
             if (Time.timeScale <= 0.0001f) return;
             ItemComponents.RetryBindings();
@@ -421,6 +426,7 @@ namespace SailwindCoop.Sync
             {
                 if (e.Item == null) continue;
                 if (e.HolderNetId == _net.MyNetId) continue;   // I hold it → the game drives it locally
+                if (host && (e.HolderNetId == 0 || !e.Net.HasData)) continue;
                 if (!e.Net.HasData) continue;
                 if (InStove(e)) continue;   // rides its stove
 
@@ -439,13 +445,13 @@ namespace SailwindCoop.Sync
                 // Keep the remote pose authoritative while letting the local player collide with
                 // world items. The item body stays kinematic; only its physical proxy colliders
                 // are restored. Held and container items remain visual-only.
-                if (!held && CrateIdOf(e.Item) == 0)
+                if (client && !held && CrateIdOf(e.Item) == 0)
                     EnableRemoteWorldCollision(e.Item);
             }
             // ApplyRemote re-enables remote proxy colliders after toggling puppet state. Unity
             // clears per-pair ignores on collider reactivation, so refresh the short drop-through
             // pairs after those transitions, not only from Tick before them.
-            ReapplyDropCollisionIgnores();
+            if (client) ReapplyDropCollisionIgnores();
         }
 
         private static void SmoothDropCorrection(ItemEntry e)
@@ -954,6 +960,11 @@ namespace SailwindCoop.Sync
             // This prevents an old or stray client stream from steering a free host-owned item.
             if (msg.Action == ItemAction.Pose && (e.HolderNetId != actor || _hostDropLeases.Contains(e.Item))) return;
             if (!e.Requests.Accept(actor, msg.RequestId, continuous)) return;
+            if (_net.Role == Role.Host && msg.Action != ItemAction.Pose)
+            {
+                e.Net.Clear();
+                e.HaveHostPoseFrame = false;
+            }
             if (!continuous && msg.RequestId != 0) { e.AckRequester = actor; e.AckRequest = msg.RequestId; }
             if (msg.Action == ItemAction.Consume)
             {
@@ -1240,11 +1251,25 @@ namespace SailwindCoop.Sync
             // An interactive State is an absolute result of the player's action and is taken whole.
             if (msg.Action == ItemAction.Drop || (msg.Action == ItemAction.State && !msg.IsInteraction))
                 msg.Health = KeepWorldOwned(e.Item, msg.Details, msg.Health);
-            ApplyWirePose(e.Item, msg.Frame, msg.BoatIndex, msg.Pos, msg.Rot, msg.Vel,
-                          acceptClientScalars ? msg.Amount : FoldableState.Capture(e.Item),
-                          acceptClientScalars ? msg.Health : e.Item.health,
-                          acceptClientScalars ? msg.Sold : e.Item.sold, acceptClientScalars ? msg.Nailed : e.Item.nailed,
-                          !leaseStartDrop && (e.HolderNetId != 0 || worldDrop));
+            bool bufferHostHeldPose = msg.Action == ItemAction.Pose && _net.Role == Role.Host;
+            if (bufferHostHeldPose)
+            {
+                if (!e.HaveHostPoseFrame || e.HostPoseFrame != msg.Frame || e.HostPoseBoatIndex != msg.BoatIndex)
+                    e.Net.Clear();
+                e.HaveHostPoseFrame = true;
+                e.HostPoseFrame = msg.Frame;
+                e.HostPoseBoatIndex = msg.BoatIndex;
+                ConfigureNetFrame(e, msg.Frame, msg.BoatIndex);
+                e.Net.Push(msg.Tick, msg.Pos, msg.Rot, msg.Vel);
+            }
+            else
+            {
+                ApplyWirePose(e.Item, msg.Frame, msg.BoatIndex, msg.Pos, msg.Rot, msg.Vel,
+                              acceptClientScalars ? msg.Amount : FoldableState.Capture(e.Item),
+                              acceptClientScalars ? msg.Health : e.Item.health,
+                              acceptClientScalars ? msg.Sold : e.Item.sold, acceptClientScalars ? msg.Nailed : e.Item.nailed,
+                              !leaseStartDrop && (e.HolderNetId != 0 || worldDrop));
+            }
             if (acceptClientScalars)
             {
                 ItemComponents.Apply(e.Item, msg.Details);
@@ -1268,6 +1293,15 @@ namespace SailwindCoop.Sync
                     EnterFreeDynamic(e.Item, msg.Frame, msg.Vel, "host drop #" + e.Index);
             }
             var state = BuildState(e, _net.Clock.ServerTick);
+            if (bufferHostHeldPose)
+            {
+                // Relay the sender's exact sample; the host renders its own copy from the same buffer.
+                state.Frame = msg.Frame;
+                state.BoatIndex = msg.BoatIndex;
+                state.Pos = msg.Pos;
+                state.Rot = msg.Rot;
+                state.Vel = msg.Vel;
+            }
             // On drop, BuildState's velocity is derived from the position history and spikes because the
             // transform just teleported to the drop point — use the client's real rigidbody velocity
             // instead, or the dropped item would be flung off the ship on every receiver.

@@ -66,6 +66,7 @@ namespace SailwindCoop
         public readonly ConfigEntry<string> PlayerName;
         public readonly ConfigEntry<int> SnapshotHz;
         public readonly ConfigEntry<float> InterpDelayMs;
+        public readonly ConfigEntry<float> BoatSmoothingMs;
 
         // Server (host) tuning.
         public readonly ConfigEntry<int> MaxClients;
@@ -135,6 +136,7 @@ namespace SailwindCoop
             PlayerName = c.Bind("Network", "PlayerName", "Player", "Displayed player name.");
             SnapshotHz = c.Bind("Network", "SnapshotHz", 20, "State snapshot send rate (Hz), Stage 1+.");
             InterpDelayMs = c.Bind("Network", "InterpDelayMs", 100f, "Interpolation buffer delay (ms), Stage 1+.");
+            BoatSmoothingMs = c.Bind("Network", "BoatSmoothingMs", 50f, "Extra client-side boat pose smoothing (ms); higher values reduce jitter but add trailing.");
 
             MaxClients = c.Bind("Server", "MaxClients", 4, "Maximum number of clients connected to the host at once (1 = single guest only). Applied on incoming connections.");
             AnnounceOnLan = c.Bind("Server", "AnnounceOnLan", true, "The host answers players of the local network who look for a game, so it appears in their co-op menu. Off = the game is joined by address only. Applied when starting the host.");
