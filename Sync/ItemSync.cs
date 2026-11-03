@@ -886,6 +886,8 @@ namespace SailwindCoop.Sync
                 // the wall pose instead of the hand pose (vanilla would sync the visual next FixedUpdate).
                 bool placedAttach = IsProxyAttached(item);
                 if (placedAttach) MoveItemToProxy(item);
+                else if (item is ShipItemBottle && ReferenceEquals(_seenHeld, item) && _seenHeldFrame == Time.frameCount)
+                    item.transform.rotation = _seenHeldRot;
                 var state = BuildState(e, _net.Clock.ServerTick);
                 state.HolderNetId = 0;
                 if (placedAttach)
@@ -1418,12 +1420,14 @@ namespace SailwindCoop.Sync
         private int _seenHeldFrame = -1;
         private void SendLocalHeldPose(float dt)
         {
-            if (_net.Role != Role.Client || _net.State != LinkState.Connected) return;
+            bool client = _net.Role == Role.Client;
+            if ((!client && _net.Role != Role.Host) || _net.State != LinkState.Connected) return;
             var held = HeldItem() as ShipItem;
             // Every frame, not at the pose rate: what the player saw last frame, after every
             // LateUpdate (see NotifyDrop).
             _seenHeld = held; _seenHeldFrame = Time.frameCount;
             if (held != null) _seenHeldRot = held.transform.rotation;
+            if (!client) return;
             if (held != null && !InPersonalInventory(held))
             {
                 // ItemRigidbody is disabled while the client puppets a held item. Follow the
