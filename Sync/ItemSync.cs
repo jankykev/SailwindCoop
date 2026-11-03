@@ -324,6 +324,7 @@ namespace SailwindCoop.Sync
         {
             TickDropPlayerCollisionIgnores();
             if (_net.State != LinkState.Connected) return;
+            TickTransitionDiagnostics();
             RefreshItems(dt);
             if (_net.Role == Role.Client && _baselineReady && _pendingSpawns.Count != 0)
             {
@@ -893,7 +894,11 @@ namespace SailwindCoop.Sync
                     state.Vel = WorldToFrameAxes(state.Frame, state.BoatIndex, worldThrow);
                     // Let GoPointer's one-frame throw coroutine apply an intentional throw locally;
                     // this reset removes only inherited player/item motion before it runs.
-                    MoveProxyToItem(item, kinematic: false, Vector3.zero);
+                    // Restore vanilla physics driver/colliders/layers/visuals for non-crated drops.
+                    if (state.CrateId == 0)
+                        EnterFreeDynamic(item, state.Frame, Vector3.zero, "host local drop #" + e.Index);
+                    else
+                        MoveProxyToItem(item, kinematic: false, Vector3.zero);
                     IgnoreLocalPlayerForDroppedItem(item);
                 }
                 _net.Broadcast(state, LiteNetLib.DeliveryMethod.ReliableOrdered);
@@ -936,6 +941,13 @@ namespace SailwindCoop.Sync
                 Remember("reject req id=" + msg.InstanceId + " prefab=" + msg.PrefabIndex);
                 return;
             }
+
+            if (msg.Action == ItemAction.Pickup || msg.Action == ItemAction.Drop ||
+                msg.Action == ItemAction.Crate || msg.Action == ItemAction.LampHook ||
+                msg.Action == ItemAction.Inventory)
+                LogItemTransition("request " + msg.Action + " actor=" + actor +
+                    " request=" + msg.RequestId + " wireCrate=" + msg.CrateId +
+                    " wireAttached=" + msg.Attached + " wireSlot=" + msg.InventorySlot, e.Item);
 
             bool continuous = msg.Action == ItemAction.Pose || msg.Action == ItemAction.AltHeld;
             // Pose streams are only valid while this peer owns the item's held/drop lease.
@@ -1000,16 +1012,23 @@ namespace SailwindCoop.Sync
                 var ie = HostLookup(msg.InstanceId, msg.PrefabIndex);
                 if (ie != null && ie.Item != null)
                 {
-                    // Use the host's crate InstanceId for this item (from item.currentCrateId),
-                    // not the client's crate InstanceId from the message (which differs for runtime-spawned crates).
-                    var crateId = CrateIdOf(ie.Item);
-                    ApplyCrateMembership(ie.Item, crateId);
+                    // Shared crates are remapped to host IDs before the client can interact with them.
+                    var crateId = msg.CrateId;
+                    if (crateId != 0 && CrateInventoryFor(crateId) == null)
+                    {
+                        LogItemTransition("reject unresolved crate request=" + msg.RequestId + " wireCrate=" + crateId, ie.Item);
+                        _net.Broadcast(BuildState(ie, _net.Clock.ServerTick), LiteNetLib.DeliveryMethod.ReliableOrdered);
+                        return;
+                    }
+                    var crateStatus = TryApplyCrateMembership(ie.Item, crateId);
                     // Insert/withdraw completes the item's storage action. A separate Drop may
                     // follow, but must not leave the host treating a stored item as still held.
                     ie.HolderNetId = 0;
                     ie.InventorySlot = -1;
                     _localHeld.Remove(ie.Item);
                     ie.Item.held = null;
+                    LogItemTransition("after host crate request=" + msg.RequestId + " target=" + crateId + " status=" + crateStatus, ie.Item);
+                    if (Plugin.Logger?.Enabled == true) _transitionDiagnostics[ie.Item] = Time.unscaledTime + 0.5f;
                     _net.Broadcast(BuildState(ie, _net.Clock.ServerTick), LiteNetLib.DeliveryMethod.ReliableOrdered);
                     Remember("in crate #" + ie.Index + "->" + crateId + " actor=" + actor);
                 }
@@ -1163,6 +1182,7 @@ namespace SailwindCoop.Sync
                     SnapHangableToHook(e.Item, hook);
                     MoveProxyToItem(e.Item, kinematic: true, Vector3.zero);
                     SetProxyAttached(e.Item, true);
+                    LogItemTransition("after host hook replay hook=" + msg.CrateId, e.Item);
                     var hookState = BuildState(e, _net.Clock.ServerTick);
                     hookState.HolderNetId = 0;
                     hookState.Attached = true;
@@ -1836,10 +1856,36 @@ namespace SailwindCoop.Sync
             catch { }
         }
 
-        private static void LogItemTransition(string label, ShipItem item)
+        private readonly Dictionary<ShipItem, float> _transitionDiagnostics = new Dictionary<ShipItem, float>();
+        private bool _transitionBuildLogged;
+
+        private void TickTransitionDiagnostics()
         {
+            if (_transitionDiagnostics.Count == 0) return;
+            if (Plugin.Logger?.Enabled != true) { _transitionDiagnostics.Clear(); return; }
+            foreach (var item in new List<ShipItem>(_transitionDiagnostics.Keys))
+            {
+                if (item != null && Time.unscaledTime < _transitionDiagnostics[item]) continue;
+                _transitionDiagnostics.Remove(item);
+                if (item != null) LogItemTransition("delayed transition +0.5s", item);
+            }
+        }
+
+        internal static void LogItemTransition(string label, ShipItem item)
+        {
+            if (Plugin.Logger == null || !Plugin.Logger.Enabled ||
+                Instance == null || !Instance.IsSessionActive) return;
             try
             {
+                if (!Instance._transitionBuildLogged)
+                {
+                    var assembly = typeof(ItemSync).Assembly;
+                    var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                    Plugin.Logger.LogInfo("[ItemSync] physics diagnostics build=" + version?.InformationalVersion +
+                        " module=" + assembly.ManifestModule.ModuleVersionId +
+                        " crateRepair=enabled hostDropRepair=enabled");
+                    Instance._transitionBuildLogged = true;
+                }
                 if (item == null)
                 {
                     Plugin.Logger.LogInfo("[ItemSync] " + label + ": item=null");
@@ -1848,6 +1894,38 @@ namespace SailwindCoop.Sync
 
                 var irb = item.GetItemRigidbody();
                 var body = irb != null ? irb.GetBody() : null;
+                var rootCol = item.GetComponent<Collider>();
+                var hangable = item.GetComponent<HangableItem>();
+                var hookCol = hangable != null
+                    ? GetFieldDeep(typeof(HangableItem), "currentHook")?.GetValue(hangable) as Collider : null;
+                var joint = irb != null ? irb.GetComponent<ConfigurableJoint>() : null;
+                var jointItem = joint != null && joint.connectedBody != null
+                    ? joint.connectedBody.GetComponent<ItemRigidbody>()?.GetShipItem() : null;
+                Instance._byItem.TryGetValue(item, out var entry);
+                var ui = CrateInventoryUI.instance;
+                int uiButton = -1;
+                if (ui != null && ui.buttons != null)
+                {
+                    foreach (var button in ui.buttons)
+                    {
+                        if (button != null && button.gameObject.activeInHierarchy &&
+                            (GetFieldDeep(typeof(CrateInventoryButton), "currentItem")?.GetValue(button) as ShipItem) == item)
+                        {
+                            uiButton = Array.IndexOf(ui.buttons, button);
+                            break;
+                        }
+                    }
+                }
+                int listedCrate = 0;
+                foreach (var candidate in Instance._items)
+                {
+                    var crate = candidate.Item != null ? candidate.Item.GetComponent<CrateInventory>() : null;
+                    if (crate != null && crate.containedItems.Contains(item))
+                    {
+                        listedCrate = InstanceIdOf(candidate.Item);
+                        break;
+                    }
+                }
                 string inv = "-";
                 try { inv = irb != null && irb.GetCurrentInventorySlot() != null ? irb.GetCurrentInventorySlot().name : "-"; } catch { }
                 string onBoat = "?";
@@ -1863,7 +1941,35 @@ namespace SailwindCoop.Sync
                 catch { }
 
                 Plugin.Logger.LogInfo("[ItemSync] " + label +
+                    " role=" + Instance._net.Role +
+                    " frame=" + Time.frameCount +
+                    " id=" + InstanceIdOf(item) +
+                    " prefab=" + PrefabIndexOf(item) +
                     " '" + item.name + "'" +
+                    " holder=" + (entry != null ? entry.HolderNetId.ToString() : "?") +
+                    " netSlot=" + (entry != null ? entry.InventorySlot.ToString() : "?") +
+                    " beltSlot=" + PersonalInventorySlotOf(item) +
+                    " hand=" + (Instance.HeldItem() == item) +
+                    " held=" + (item.held != null) +
+                    " crate=" + CrateIdOf(item) +
+                    " listedCrate=" + listedCrate +
+                    " uiOpen=" + (ui != null && ui.showingUI) +
+                    " uiCrate=" + (ui != null && ui.currentCrate != null
+                        ? InstanceIdOf(ui.currentCrate.GetComponent<ShipItem>()) : 0) +
+                    " uiContains=" + (ui != null && ui.currentCrate != null && ui.currentCrate.containedItems.Contains(item)) +
+                    " uiButton=" + uiButton +
+                    " hanging=" + (hangable != null && hangable.IsHanging()) +
+                    " hook=" + (hookCol != null ? InstanceIdOf(hookCol.GetComponent<ShipItem>()) : 0) +
+                    " jointBody=" + (joint != null && joint.connectedBody != null ? joint.connectedBody.name : "-") +
+                    " jointItem=" + InstanceIdOf(jointItem) +
+                    " jointCount=" + (irb != null ? irb.GetComponents<ConfigurableJoint>().Length : 0) +
+                    " hookOccupied=" + (item is ShipItemLampHook
+                        ? GetFieldDeep(typeof(ShipItemLampHook), "occupied")?.GetValue(item)?.ToString() : "-") +
+                    " attached=" + (irb != null ? irb.attached.ToString() : "-") +
+                    " disableCol=" + (irb != null ? irb.disableCol.ToString() : "-") +
+                    " inStove=" + (irb != null ? irb.inStove.ToString() : "-") +
+                    " layer=" + item.gameObject.layer +
+                    " rootCol=" + (rootCol != null ? rootCol.enabled.ToString() : "-") +
                     " pos=" + item.transform.position.ToString("F2") +
                     " parent=" + (item.transform.parent != null ? item.transform.parent.name : "-") +
                     " boat=" + (item.currentActualBoat != null ? item.currentActualBoat.name : "-") +
@@ -1872,8 +1978,13 @@ namespace SailwindCoop.Sync
                     " irbEnabled=" + (irb != null ? irb.enabled.ToString() : "-") +
                     " rbKin=" + (body != null ? body.isKinematic.ToString() : "-") +
                     " rbDetect=" + (body != null ? body.detectCollisions.ToString() : "-") +
+                    " rbVel=" + (body != null ? body.velocity.ToString("F2") : "-") +
+                    " rbPos=" + (body != null ? body.position.ToString("F2") : "-") +
+                    " rbSleep=" + (body != null ? body.IsSleeping().ToString() : "-") +
                     " onBoat=" + onBoat +
                     " scale=" + item.transform.localScale.ToString("F2"));
+                if (label == "after local drop" || label == "after local pickup")
+                    Instance._transitionDiagnostics[item] = Time.unscaledTime + 0.5f;
             }
             catch (Exception ex)
             {
@@ -3106,6 +3217,7 @@ namespace SailwindCoop.Sync
             if (InteractionContext.Suppressed) return;
             if (ItemOperationCapture.Absorb()) return;
             if (ApplyingCrate || _net.State != LinkState.Connected || item == null) return;
+            LogItemTransition("local crate callback", item);
             RefreshItems(force: false);
             if (!_byItem.TryGetValue(item, out var e)) return;
             if (_net.Role == Role.Client && !_hostIds.Contains(e.InstanceId)) return;
@@ -4315,6 +4427,8 @@ namespace SailwindCoop.Sync
 
         public void Clear()
         {
+            _transitionDiagnostics.Clear();
+            _transitionBuildLogged = false;
             _manualMugScroll.Clear();
             _clientDropLeases.Clear();
             _dropLeaseScratch.Clear();

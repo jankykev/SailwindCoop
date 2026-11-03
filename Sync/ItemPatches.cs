@@ -47,6 +47,10 @@ namespace SailwindCoop.Sync
                 prefixName: nameof(PreRodItemClick), postfixName: nameof(PostRodItemClick));
             TryPatch(harmony, hooks, typeof(ShipItemLampHook), "OnItemClick", new[] { typeof(PickupableItem) },
                 postfixName: nameof(PostLampHookItemClick));
+            TryPatch(harmony, hooks, typeof(HangableItem), "ConnectJoint", new[] { typeof(Collider) },
+                prefixName: nameof(PreHangableJoint), postfixName: nameof(PostHangableJoint));
+            TryPatch(harmony, hooks, typeof(HangableItem), "DisconnectJoint", Type.EmptyTypes,
+                prefixName: nameof(PreHangableJoint), postfixName: nameof(PostHangableJoint));
             // Crates: mirror inventory membership (Insert/Withdraw) and relay unseal (item creation) to host.
             TryPatch(harmony, hooks, typeof(CrateInventory), "InsertItem", new[] { typeof(ShipItem) }, postfixName: nameof(PostCrateInsert));
             TryPatch(harmony, hooks, typeof(CrateInventory), "WithdrawItem", new[] { typeof(ShipItem) }, postfixName: nameof(PostCrateWithdraw));
@@ -104,7 +108,8 @@ namespace SailwindCoop.Sync
         }
 
         private static void PrePickup(PickupableItem item)
-        { try { MooringPatches.ForgetPickup(item as PickupableBoatMooringRope); }
+        { try { ItemSync.LogItemTransition("before local pickup", item as ShipItem);
+                MooringPatches.ForgetPickup(item as PickupableBoatMooringRope); }
           catch (Exception e) { WarnPatch("[ItemPatches] PrePickup: " + e); } }
         private static void PostPickup(GoPointer __instance, PickupableItem item)
         {
@@ -112,6 +117,7 @@ namespace SailwindCoop.Sync
             {
                 ItemSync.Instance?.PrepareMugPickup(item);
                 ItemSync.Instance?.NotifyPickup(__instance, item);
+                ItemSync.LogItemTransition("after local pickup", item as ShipItem);
             }
             catch (Exception e) { WarnPatch("[ItemPatches] PostPickup: " + e.Message); }
         }
@@ -156,6 +162,7 @@ namespace SailwindCoop.Sync
                     _fPointedAtButton = typeof(GoPointer).GetField("pointedAtButton", BindingFlags.NonPublic | BindingFlags.Instance);
 
                 var item = _fHeldItem != null ? _fHeldItem.GetValue(__instance) as PickupableItem : null;
+                ItemSync.LogItemTransition("before local drop", item as ShipItem);
                 var pointedAt = _fPointedAtButton != null ? _fPointedAtButton.GetValue(__instance) as GoPointerButton : null;
                 MooringPatches.MarkDrop(item as PickupableBoatMooringRope);
                 ItemOperationCapture.MarkDrop(item as ShipItem);
@@ -172,8 +179,23 @@ namespace SailwindCoop.Sync
 
         private static void PostDrop(GoPointer __instance, DropState __state)
         {
-            try { ItemSync.Instance?.NotifyDrop(__instance, __state != null ? __state.Item : null, ComputeThrowVelocity(__instance), __state != null && __state.SurfacePlaced); }
+            try { ItemSync.Instance?.NotifyDrop(__instance, __state != null ? __state.Item : null, ComputeThrowVelocity(__instance), __state != null && __state.SurfacePlaced);
+                  ItemSync.LogItemTransition("after local drop", __state?.Item as ShipItem); }
             catch (Exception e) { WarnPatch("[ItemPatches] PostDrop: " + e.Message); }
+        }
+
+        private static void PreHangableJoint(HangableItem __instance, MethodBase __originalMethod)
+        {
+            if (Plugin.Logger?.Enabled != true) return;
+            try { ItemSync.LogItemTransition("before " + __originalMethod.Name, __instance.GetComponent<ShipItem>()); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PreHangableJoint: " + e.Message); }
+        }
+
+        private static void PostHangableJoint(HangableItem __instance, MethodBase __originalMethod)
+        {
+            if (Plugin.Logger?.Enabled != true) return;
+            try { ItemSync.LogItemTransition("after " + __originalMethod.Name, __instance.GetComponent<ShipItem>()); }
+            catch (Exception e) { WarnPatch("[ItemPatches] PostHangableJoint: " + e.Message); }
         }
 
         private static void PostPlacementTrigger(PickupableItemCollisionChecker __instance)
@@ -649,20 +671,34 @@ namespace SailwindCoop.Sync
 
         private static void PostInventoryInsert(ShipItem __0)
         {
-            try { ItemSync.Instance?.OnLocalInventory(__0); }
+            try
+            {
+                ItemSync.LogItemTransition("after vanilla belt insert", __0);
+                ItemSync.Instance?.OnLocalInventory(__0);
+                ItemSync.LogItemTransition("after sync belt insert", __0);
+            }
             catch (Exception e) { WarnPatch("[ItemPatches] PostInventoryInsert: " + e.Message); }
         }
 
         private static void PreInventoryWithdraw(GPButtonInventorySlot __instance, out ShipItem __state)
         {
             __state = null;
-            try { __state = __instance != null ? __instance.currentItem : null; }
+            try
+            {
+                __state = __instance != null ? __instance.currentItem : null;
+                ItemSync.LogItemTransition("before belt withdraw", __state);
+            }
             catch { __state = null; }
         }
 
         private static void PostInventoryWithdraw(ShipItem __state)
         {
-            try { if (__state != null) ItemSync.Instance?.OnLocalInventory(__state); }
+            try
+            {
+                ItemSync.LogItemTransition("after vanilla belt withdraw", __state);
+                if (__state != null) ItemSync.Instance?.OnLocalInventory(__state);
+                ItemSync.LogItemTransition("after sync belt withdraw", __state);
+            }
             catch (Exception e) { WarnPatch("[ItemPatches] PostInventoryWithdraw: " + e.Message); }
         }
     }
