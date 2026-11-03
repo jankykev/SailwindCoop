@@ -252,7 +252,7 @@ namespace SailwindCoop.Sync
             if (ropes == null || msg.Index >= ropes.Length || ropes[msg.Index] == null)
             { SendMissingObject(msg, actor); return; }
             _dockRequests.Remove(msg.Index);
-            if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in request", applyMoorLength: false, dockId: msg.DockId))
+            if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in request", applyMoorLength: false))
             { _dockRequests[msg.Index] = new DeferredDock { Request = msg, Actor = actor }; SendWaitingDock(msg, actor); return; }
             SendRopeState(msg.Index, actor, msg.RequestId);
             // The acknowledgement and snapshots share ReliableOrdered, including to the requester.
@@ -301,10 +301,10 @@ namespace SailwindCoop.Sync
             if (ropes == null || index >= ropes.Length || ropes[index] == null) return;
             var rope = ropes[index];
             bool held = IsLocallyHeld(rope) || CarryPending(index);
-            state.TryApply(held, msg => Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in", recordInteraction: msg.IsInteraction, dockId: msg.DockId));
+            state.TryApply(held, msg => Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in", recordInteraction: msg.IsInteraction));
         }
 
-        private bool Apply(ushort index, MooringKind kind, Vector3 dockReal, float lengthSq, string tag, bool applyMoorLength = true, bool recordInteraction = true, string dockId = "")
+        private bool Apply(ushort index, MooringKind kind, Vector3 dockReal, float lengthSq, string tag, bool applyMoorLength = true, bool recordInteraction = true)
         {
             var ropes = _bm != null ? _bm.ropes : null;
             if (ropes == null || index >= ropes.Length) { RefetchBoat(); ropes = _bm != null ? _bm.ropes : null; }
@@ -327,13 +327,13 @@ namespace SailwindCoop.Sync
                 }
                 else if (kind == MooringKind.Moor)
                 {
-                    var dock = FindDock(dockId, dockReal);
+                    var dock = FindDock(dockReal);
                     if (dock == null)
                     {
                         if (_missingApplyDock.Add(index))
                             Plugin.Logger.LogWarning("[MooringSync] " + _net.Role + " cannot apply Moor boat=" + _boatId +
                                 " rope #" + index + " dockReal=" + dockReal + ": no loaded dock within 3 m" +
-                                "; target deferred, dockId=" + dockId);
+                                "; target deferred");
                         return false;
                     }
                     _missingApplyDock.Remove(index);

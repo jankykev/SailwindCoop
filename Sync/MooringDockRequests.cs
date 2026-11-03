@@ -17,12 +17,11 @@ namespace SailwindCoop.Sync
             for (var t = dock.transform; t != null; t = t.parent) path = "/" + t.name + "[" + t.GetSiblingIndex() + "]" + path;
             return dock.gameObject.scene.name + path;
         }
-        private static GPButtonDockMooring FindDock(string id, Vector3 real)
+        private static GPButtonDockMooring FindDock(Vector3 real)
         {
-            if (!string.IsNullOrEmpty(id))
-                foreach (var dock in UnityEngine.Object.FindObjectsOfType<GPButtonDockMooring>())
-                    if (DockIdentity(dock) == id) return dock;
-            return FindDockNear(real); // Identity fallback locates a loaded object, not action eligibility.
+            // A hierarchy path can name a different dock on another machine; the transmitted
+            // world position is authoritative, so never let an ID match override the nearest dock.
+            return FindDockNear(real);
         }
         private void SendWaitingDock(MooringRequestMsg msg, uint actor)
             => _net.Broadcast(new MooringStateMsg { BoatIndex = _boatId, LayoutHash = _layoutHash, Index = msg.Index,
@@ -37,8 +36,8 @@ namespace SailwindCoop.Sync
             foreach (var pair in new List<KeyValuePair<ushort, DeferredDock>>(_dockRequests))
             {
                 var msg = pair.Value.Request;
-                if (FindDock(msg.DockId, msg.DockReal) == null) continue;
-                if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in deferred request", applyMoorLength: false, dockId: msg.DockId)) continue;
+                if (FindDock(msg.DockReal) == null) continue;
+                if (!Apply(msg.Index, msg.Kind, msg.DockReal, msg.LengthSq, "in deferred request", applyMoorLength: false)) continue;
                 _dockRequests.Remove(pair.Key);
                 SendRopeState(msg.Index, pair.Value.Actor, msg.RequestId);
             }

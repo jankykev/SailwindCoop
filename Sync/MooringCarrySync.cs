@@ -158,11 +158,16 @@ namespace SailwindCoop.Sync
             carry.Holder = msg.Held ? actor : 0; carry.FromDock = msg.FromDock;
             if (msg.Action != MooringCarryAction.Pose) { carry.Pose.Clear(); carry.AckActor = actor; carry.AckRequest = msg.RequestId; }
             BufferCarry(carry, _net.Clock.ServerTick, msg.Frame, msg.Pos, msg.Rot, msg.Vel);
+            bool unmoored = false;
             if (carry.Item.held == null)
             {
                 using (InteractionContext.Begin(InteractionSource.RemoteApply))
                 {
-                    if (msg.Held && msg.Part == 0 && _bm.ropes[msg.Index].IsMoored()) _bm.ropes[msg.Index].Unmoor();
+                    if (msg.Held && msg.Part == 0 && _bm.ropes[msg.Index].IsMoored())
+                    {
+                        _bm.ropes[msg.Index].Unmoor();
+                        unmoored = true;
+                    }
                     SlaveCarry(carry); carry.Pose.Apply(carry.Item.transform, _net.Clock.ServerTick);
                     // A drop runs the game's own return sequence, which reads the rope attachment and
                     // resets the visual itself when it ends. Resetting the visual first clears that
@@ -179,6 +184,9 @@ namespace SailwindCoop.Sync
                     (msg.Part == 0 ? " end" : " coil") + " player=" + actor + " request=" + msg.RequestId);
                 SendCarryState(carry, true);
             }
+            // A pickup may unmoor the host copy before the separate mooring request arrives.
+            // Publish that transition now instead of leaving peers on the 1-second snapshot.
+            if (unmoored) SendRopeState(carry.Index);
         }
         public void OnCarryState(MooringCarryStateMsg msg, NetPeer peer)
         {

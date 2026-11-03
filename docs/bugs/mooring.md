@@ -1,6 +1,6 @@
 # Mooring Knot Offset / Snap-Back — Commit 526ca55
 
-**Status:** ATTEMPTED FIX — RUNTIME UNVERIFIED (Medium) | **Tested:** 2026-11-02 | **Baseline:** e887060 → **Current:** 526ca55
+**Status:** PRESENT — SECOND ATTEMPT UNVERIFIED (Medium) | **Tested:** 2026-11-02 | **Baseline:** e887060 → **Current:** 526ca55
 
 ---
 
@@ -33,11 +33,13 @@ Mooring rope knot position was reported as non-deterministic across machines, wi
 
 ---
 
-## Investigation and Attempted Fix
+## Investigation and Fix Attempts
 
-`DockIdentity` now uses the dock's scene name and real-space position rounded to three decimal places, formatted with invariant culture. This removes sibling ordering from exact dock matching; the existing nearest-dock fallback remains unchanged.
+The first attempt changed `DockIdentity` to a rounded real-space position but did not resolve the reported behavior and was reverted. A hierarchy-path match can still select the wrong dock, so the current attempt makes the transmitted real-space position authoritative for dock lookup.
 
-Static review confirms mooring actions resolve the received dock identity first and fall back to the nearest loaded dock within 3 m. This change is **not marked fixed** until a build/deploy succeeds and host/client in-game checks confirm the snap-back and knot placement criteria.
+Client pickup can also unmoor the host's rope through the carry protocol before a separate mooring request arrives. The current attempt immediately broadcasts the host's resulting rope state rather than waiting for the periodic snapshot.
+
+This attempt is **not marked fixed** until a build/deploy succeeds and host/client in-game checks confirm the snap-back and knot placement criteria.
 
 ## Related Systems Reviewed
 
