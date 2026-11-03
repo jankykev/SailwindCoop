@@ -3315,8 +3315,16 @@ namespace SailwindCoop.Sync
 
             if (_net.Role == Role.Host)
             {
-                // Host belt items are player-local too; the RefreshItems diff broadcasts despawn (in) / spawn (out).
                 RefreshItems(force: true);
+                if (slot < 0 && _byItem.TryGetValue(item, out var hostEntry))
+                {
+                    hostEntry.HolderNetId = _net.MyNetId;
+                    hostEntry.InventorySlot = -1;
+                    var state = BuildState(hostEntry, _net.Clock.ServerTick);
+                    state.HolderNetId = _net.MyNetId;
+                    state.InventorySlot = -1;
+                    _net.Broadcast(state, LiteNetLib.DeliveryMethod.ReliableOrdered);
+                }
                 Remember("local host belt slot=" + slot);
                 return;
             }
@@ -3346,9 +3354,17 @@ namespace SailwindCoop.Sync
 
             if (_net.Role == Role.Host)
             {
-                // Host's own belt: the RefreshItems diff already despawned it for clients. Nothing to send.
                 _localHeld.Remove(item);
                 RestoreLocalInventoryVisual(item, inInventory: true);
+                if (_byItem.TryGetValue(item, out var hostEntry))
+                {
+                    hostEntry.HolderNetId = 0;
+                    hostEntry.InventorySlot = slot;
+                    var state = BuildState(hostEntry, _net.Clock.ServerTick);
+                    state.HolderNetId = 0;
+                    state.InventorySlot = slot;
+                    _net.Broadcast(state, LiteNetLib.DeliveryMethod.ReliableOrdered);
+                }
                 Remember("local host claim->belt slot=" + slot);
                 return;
             }
