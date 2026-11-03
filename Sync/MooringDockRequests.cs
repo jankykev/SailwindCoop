@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using LiteNetLib;
 using SailwindCoop.Net;
 using UnityEngine;
@@ -12,10 +13,12 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<ushort, DeferredDock> _dockRequests = new Dictionary<ushort, DeferredDock>();
         private static string DockIdentity(GPButtonDockMooring dock)
         {
-            if (dock == null) return "";
-            string path = "";
-            for (var t = dock.transform; t != null; t = t.parent) path = "/" + t.name + "[" + t.GetSiblingIndex() + "]" + path;
-            return dock.gameObject.scene.name + path;
+            if (dock == null || !CoordSpace.Ready) return "";
+            Vector3 real = CoordSpace.LocalToReal(dock.transform.position);
+            return dock.gameObject.scene.name + "|" +
+                   real.x.ToString("F3", CultureInfo.InvariantCulture) + "," +
+                   real.y.ToString("F3", CultureInfo.InvariantCulture) + "," +
+                   real.z.ToString("F3", CultureInfo.InvariantCulture);
         }
         private static GPButtonDockMooring FindDock(string id, Vector3 real)
         {
